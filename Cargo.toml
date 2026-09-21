@@ -1,5 +1,5 @@
 [workspace]
-members = []
+members = ["crates/hem-core"]
 resolver = "2"
 
 [workspace.package]
