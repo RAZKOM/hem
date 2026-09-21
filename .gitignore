@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+testdata/*.log
+testdata/*.gz
+!testdata/sample*.log
+hem-debug.log
+docs/logs_*.zip
