@@ -11,6 +11,9 @@ use parking_lot::{Mutex, RwLock};
 use crate::source::Source;
 use crate::view::Row;
 
+/// Maximum number of sources in a merge (rows carry an 8-bit source id).
+pub const MAX_SOURCES: usize = 256;
+
 /// A timestamp-merged set of sources.
 pub struct Merged {
     pub sources: Vec<Source>,
@@ -45,5 +48,22 @@ impl Merged {
         self.len() == 0
     }
 
+    pub fn rows_range(&self, a: usize, b: usize) -> Vec<Row> {
+        let rows = self.rows.read();
+        let b = b.min(rows.len());
+        rows[a.min(b)..b].to_vec()
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
+        self.wakers.lock().push(w);
+    }
 }
 

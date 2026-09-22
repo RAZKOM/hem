@@ -125,6 +125,16 @@ impl std::fmt::Debug for SourceGuard<'_> {
 }
 
 impl SourceGuard<'_> {
+    /// A reference-counted handle to the current data buffer, for background
+    /// jobs that want to scan without holding the lock.
+    pub fn data_arc(&self) -> Arc<Data> {
+        Arc::clone(&self.guard.data)
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.guard.generation
+    }
+
     pub fn len(&self) -> u64 {
         self.guard.index.scanned()
     }
@@ -137,6 +147,30 @@ impl SourceGuard<'_> {
         self.guard.index.line_count()
     }
 
+    /// Raw bytes of line `i` without its terminator.
+    pub fn line(&self, i: usize) -> Option<&[u8]> {
+        let data = &self.guard.data;
+        let (s, e) = self.guard.index.span(i, data)?;
+        data.get(s as usize..e as usize)
+    }
+
+    /// Byte span of line `i` (without terminator).
+    pub fn span(&self, i: usize) -> Option<(u64, u64)> {
+        self.guard.index.span(i, &self.guard.data)
+    }
+
+    /// Push `(start, len)` spans (without terminators) for lines `a..b`.
+    pub fn spans_into(&self, a: usize, b: usize, out: &mut Vec<(u64, u32)>) {
+        let data = &self.guard.data;
+        let idx = &self.guard.index;
+        let b = b.min(idx.line_count());
+        out.reserve(b.saturating_sub(a));
+        for i in a..b {
+            if let Some((s, e)) = idx.span(i, data) {
+                out.push((s, (e - s) as u32));
+            }
+        }
+    }
 }
 
 impl Source {
@@ -154,6 +188,45 @@ impl Source {
     /// Lines indexed so far (lock-free).
     pub fn line_count(&self) -> usize {
         self.0.stats.line_count.load(Ordering::Acquire)
+    }
+
+    /// Bytes indexed so far (lock-free).
+    pub fn indexed_bytes(&self) -> u64 {
+        self.0.stats.indexed_bytes.load(Ordering::Acquire)
+    }
+
+    /// Size of the underlying file as last observed (lock-free).
+    pub fn total_bytes(&self) -> u64 {
+        self.0.stats.total_bytes.load(Ordering::Acquire)
+    }
+
+    /// True once everything currently in the file has been indexed.
+    pub fn is_complete(&self) -> bool {
+        self.0.stats.complete.load(Ordering::Acquire)
+    }
+
+    /// True once a finite input (stdin, gzip, memory) has been fully read.
+    pub fn is_eof(&self) -> bool {
+        self.0.stats.eof.load(Ordering::Acquire)
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.0.stats.generation.load(Ordering::Acquire)
+    }
+
+    /// Install a callback invoked whenever new data becomes available.
+    pub fn add_waker(&self, waker: Waker) {
+        self.0.wakers.lock().push(waker);
+    }
+
+    /// Does this source keep growing (file being followed / stdin / gzip
+    /// still decompressing)?  Finite inputs report `false` once at EOF.
+    pub fn is_live(&self) -> bool {
+        match self.0.kind {
+            SourceKind::File => self.0.follow,
+            SourceKind::Memory => !self.0.stop.load(Ordering::Acquire),
+            SourceKind::Stdin | SourceKind::Gzip => !self.is_eof(),
+        }
     }
 
 }

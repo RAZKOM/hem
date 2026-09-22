@@ -1,5 +1,8 @@
 //! Log levels and keyword detection.
 
+use std::sync::OnceLock;
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde::{Deserialize, Serialize};
 
 /// Severity level, ordered from least to most severe.
@@ -64,6 +67,37 @@ impl std::fmt::Display for Level {
         f.write_str(self.as_str())
     }
 }
+
+const KEYWORDS: &[(&str, Level)] = &[
+    ("TRACE", Level::Trace),
+    ("DEBUG", Level::Debug),
+    ("INFO", Level::Info),
+    ("NOTICE", Level::Info),
+    ("WARNING", Level::Warn),
+    ("WARN", Level::Warn),
+    ("ERROR", Level::Error),
+    ("SEVERE", Level::Error),
+    ("FATAL", Level::Fatal),
+    ("CRITICAL", Level::Fatal),
+    ("PANIC", Level::Fatal),
+    ("EMERG", Level::Fatal),
+    ("ALERT", Level::Fatal),
+    ("CRIT", Level::Fatal),
+];
+
+fn matcher() -> &'static AhoCorasick {
+    static AC: OnceLock<AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| {
+        AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(KEYWORDS.iter().map(|(k, _)| *k))
+            .expect("static level patterns are valid")
+    })
+}
+
+/// Maximum number of bytes scanned for a level keyword.
+const SCAN_LIMIT: usize = 4096;
 
 #[cfg(test)]
 mod tests {

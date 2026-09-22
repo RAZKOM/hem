@@ -1,8 +1,9 @@
 //! Lazy per-line metadata: timestamp and level, with a bounded cache.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::level::Level;
 
@@ -24,6 +25,11 @@ pub struct LineMeta {
 pub struct CustomPatterns {
     pub level: Option<regex::bytes::Regex>,
     pub timestamp: Option<regex::bytes::Regex>,
+}
+
+fn custom() -> &'static RwLock<Option<CustomPatterns>> {
+    static C: OnceLock<RwLock<Option<CustomPatterns>>> = OnceLock::new();
+    C.get_or_init(|| RwLock::new(None))
 }
 
 /// Bounded cache of line metadata keyed by `(generation, line index)`.

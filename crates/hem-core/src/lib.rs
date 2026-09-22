@@ -16,8 +16,10 @@ pub mod index;
 pub mod level;
 pub mod merge;
 pub mod parse;
+pub mod search;
 pub mod source;
 pub mod timeline;
+pub mod timestamp;
 pub mod view;
 
 pub use error::{Error, Result};

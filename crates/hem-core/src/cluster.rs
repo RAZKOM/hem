@@ -6,11 +6,15 @@
 //! updated (differing positions become `<*>`) or a new template is created.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use parking_lot::{Mutex, RwLock};
 
 use crate::filter::Token;
 use crate::format::Format;
 use crate::level::Level;
-use crate::view::Row;
+use crate::view::{Base, Row};
 
 /// A mined template.
 #[derive(Debug, Clone)]
@@ -67,6 +71,48 @@ impl Miner {
 
     pub fn is_empty(&self) -> bool {
         self.templates.is_empty()
+    }
+}
+
+struct Inner {
+    base: Base,
+    snapshot: RwLock<Arc<Vec<Template>>>,
+    processed: AtomicU64,
+    stride: AtomicU64,
+    complete: AtomicBool,
+    cancel: AtomicBool,
+    wakers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+    cap: usize,
+}
+
+/// Background clustering job over a base.
+#[derive(Clone)]
+pub struct Clusters(Arc<Inner>);
+
+impl std::fmt::Debug for Clusters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Clusters({} templates)", self.templates().len())
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+impl Clusters {
+    /// Current templates (a cheap snapshot).
+    pub fn templates(&self) -> Arc<Vec<Template>> {
+        Arc::clone(&self.0.snapshot.read())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.0.complete.load(Ordering::Acquire)
+    }
+
+    pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
+        self.0.wakers.lock().push(w);
     }
 }
 

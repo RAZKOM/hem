@@ -155,4 +155,31 @@ mod tests {
         assert_eq!(idx.span(0, &data), Some((0, data.len() as u64)));
     }
 
+    #[test]
+    fn incremental_growth() {
+        let mut data = b"a\nb".to_vec();
+        let mut idx = LineIndex::new();
+        idx.extend_from(&data);
+        assert_eq!(idx.line_count(), 2);
+        data.extend_from_slice(b"b\nc\n");
+        idx.extend_from(&data);
+        assert_eq!(idx.line_count(), 3);
+        let (s, e) = idx.span(1, &data).unwrap();
+        assert_eq!(&data[s as usize..e as usize], b"bb");
+        data.extend_from_slice(b"d");
+        idx.extend_from(&data);
+        assert_eq!(idx.line_count(), 4);
+    }
+
+    #[test]
+    fn line_at_offset() {
+        let data = b"aa\nbb\ncc\n";
+        let mut idx = LineIndex::new();
+        idx.extend_from(data);
+        assert_eq!(idx.line_at(0), 0);
+        assert_eq!(idx.line_at(2), 0);
+        assert_eq!(idx.line_at(3), 1);
+        assert_eq!(idx.line_at(7), 2);
+        assert_eq!(idx.line_at(100), 2);
+    }
 }

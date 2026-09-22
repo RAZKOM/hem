@@ -14,8 +14,10 @@ serde.workspace = true
 memchr.workspace = true
 regex.workspace = true
 rayon.workspace = true
+chrono.workspace = true
 parking_lot.workspace = true
 tempfile.workspace = true
 memmap2 = "0.9"
+aho-corasick = "1"
 
 [dev-dependencies]

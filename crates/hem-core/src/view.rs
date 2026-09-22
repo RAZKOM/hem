@@ -20,9 +20,32 @@ use crate::merge::Merged;
 use crate::source::{Data, Source};
 use crate::timeline::Histogram;
 
+/// Rows processed per work unit.
+pub const CHUNK_ROWS: usize = 32 * 1024;
+const MAX_COUNT: u32 = 0xFFFF;
+
 /// Packed row reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Row(u64);
+
+impl Row {
+    pub const LINE_BITS: u32 = 40;
+    pub const LINE_MASK: u64 = (1 << Self::LINE_BITS) - 1;
+
+    pub fn new(line: u64, source: u8, count: u32) -> Self {
+        let count = count.min(MAX_COUNT) as u64;
+        Row((line & Self::LINE_MASK) | ((source as u64) << 40) | (count << 48))
+    }
+
+    pub fn line(self) -> u64 {
+        self.0 & Self::LINE_MASK
+    }
+
+    pub fn source(self) -> u8 {
+        ((self.0 >> 40) & 0xFF) as u8
+    }
+
+}
 
 /// A batch of rows with their bytes, detached from the source locks.
 #[derive(Debug)]
@@ -44,6 +67,11 @@ impl Chunk {
         self.rows.is_empty()
     }
 
+    pub fn line(&self, i: usize) -> &[u8] {
+        let (s, l) = self.spans[i];
+        let data = &self.datas[self.rows[i].source() as usize];
+        data.get(s as usize..(s + l as u64) as usize).unwrap_or(&[])
+    }
 }
 
 /// What a view is built over.
@@ -54,6 +82,21 @@ pub enum Base {
 }
 
 impl Base {
+    pub fn sources(&self) -> Vec<Source> {
+        match self {
+            Base::Single(s) => vec![s.clone()],
+            Base::Merged(m) => m.sources.clone(),
+        }
+    }
+
+    pub fn source(&self, idx: u8) -> Option<Source> {
+        match self {
+            Base::Single(s) if idx == 0 => Some(s.clone()),
+            Base::Single(_) => None,
+            Base::Merged(m) => m.sources.get(idx as usize).cloned(),
+        }
+    }
+
     pub fn name(&self) -> String {
         match self {
             Base::Single(s) => s.name().to_string(),
@@ -71,6 +114,87 @@ impl Base {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Changes whenever the underlying data is reset (rotation/truncation).
+    pub fn generation(&self) -> u32 {
+        match self {
+            Base::Single(s) => s.generation(),
+            Base::Merged(m) => m.generation(),
+        }
+    }
+
+    /// Everything currently on disk has been processed.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Base::Single(s) => s.is_complete(),
+            Base::Merged(m) => m.is_complete(),
+        }
+    }
+
+    pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
+        match self {
+            Base::Single(s) => s.add_waker(w),
+            Base::Merged(m) => m.add_waker(w),
+        }
+    }
+
+    /// Fetch base rows `a..b` with their bytes.
+    pub fn chunk(&self, a: usize, b: usize) -> Chunk {
+        match self {
+            Base::Single(s) => {
+                let g = s.read();
+                let b = b.min(g.line_count());
+                let a = a.min(b);
+                let mut spans = Vec::with_capacity(b - a);
+                g.spans_into(a, b, &mut spans);
+                let rows = (a..a + spans.len())
+                    .map(|i| Row::new(i as u64, 0, 1))
+                    .collect();
+                Chunk {
+                    datas: vec![g.data_arc()],
+                    rows,
+                    spans,
+                    first: a,
+                }
+            }
+            Base::Merged(m) => {
+                let rows = m.rows_range(a, b);
+                let mut c = self.fetch(&rows);
+                c.first = a;
+                c
+            }
+        }
+    }
+
+    /// Fetch arbitrary rows (e.g. a view's rows) with their bytes.
+    pub fn fetch(&self, rows: &[Row]) -> Chunk {
+        let sources = self.sources();
+        let guards: Vec<_> = sources.iter().map(|s| s.read()).collect();
+        let datas: Vec<Arc<Data>> = guards.iter().map(|g| g.data_arc()).collect();
+        let mut spans = Vec::with_capacity(rows.len());
+        let mut kept = Vec::with_capacity(rows.len());
+        for r in rows {
+            let Some(g) = guards.get(r.source() as usize) else {
+                continue;
+            };
+            match g.span(r.line() as usize) {
+                Some((s, e)) => {
+                    spans.push((s, (e - s) as u32));
+                    kept.push(*r);
+                }
+                None => {
+                    spans.push((0, 0));
+                    kept.push(*r);
+                }
+            }
+        }
+        Chunk {
+            datas,
+            rows: kept,
+            spans,
+            first: 0,
+        }
     }
 
 }
