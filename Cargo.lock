@@ -89,6 +89,7 @@ version = "0.1.0"
 name = "hem-core"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "memmap2",
  "parking_lot",
  "rayon",

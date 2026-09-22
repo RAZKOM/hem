@@ -52,3 +52,13 @@ impl std::str::FromStr for Format {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_names() {
+        assert_eq!("JSON".parse::<Format>().ok(), Some(Format::Json));
+        assert!("xml".parse::<Format>().is_err());
+    }
+}

@@ -129,6 +129,10 @@ impl SourceGuard<'_> {
         self.guard.index.scanned()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.line_count() == 0
+    }
+
     pub fn line_count(&self) -> usize {
         self.guard.index.line_count()
     }

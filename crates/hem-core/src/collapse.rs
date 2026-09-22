@@ -110,4 +110,35 @@ mod tests {
         String::from_utf8_lossy(&normalize(s.as_bytes())).into_owned()
     }
 
+    #[test]
+    fn masks_numbers_and_ids() {
+        assert_eq!(n("retry 3 of 10"), "retry # of #");
+        assert_eq!(n("req 0x7fff12 done"), "req # done");
+        assert_eq!(
+            n("id=550e8400-e29b-41d4-a716-446655440000 ok"),
+            "id=#-#-#-#-# ok"
+        );
+        assert_eq!(n("from 10.0.0.12:8080"), "from #.#.#.#:#");
+        assert_eq!(n("2026-10-13T10:02:11.204Z x"), "#-#-#T#:#:#.#Z x");
+    }
+
+    #[test]
+    fn masks_quoted_strings_and_space_runs() {
+        assert_eq!(
+            n(r#"user "bob smith"   logged in"#),
+            r##"user "#" logged in"##
+        );
+        assert_eq!(n("a\t\tb"), "a b");
+        assert_eq!(n("unterminated \"quote here"), "unterminated \"quote here");
+    }
+
+    #[test]
+    fn words_survive() {
+        assert_eq!(n("dead beef cafe"), "dead beef cafe");
+        assert_eq!(
+            n("ERROR connection reset by peer"),
+            "ERROR connection reset by peer"
+        );
+        assert_eq!(n("abc123def"), "#");
+    }
 }

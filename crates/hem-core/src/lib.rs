@@ -15,6 +15,7 @@ pub mod format;
 pub mod index;
 pub mod level;
 pub mod merge;
+pub mod parse;
 pub mod source;
 pub mod timeline;
 pub mod view;

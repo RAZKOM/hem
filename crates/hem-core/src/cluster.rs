@@ -65,5 +65,8 @@ impl Miner {
         self.templates.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
 }
 

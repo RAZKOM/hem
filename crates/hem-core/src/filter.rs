@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
 use crate::format::Format;
 use crate::level::Level;
 
@@ -39,6 +40,85 @@ pub struct FieldPredicate {
     pub value: String,
     number: Option<f64>,
     regex: Option<regex::Regex>,
+}
+
+impl FieldPredicate {
+    /// Parse expressions such as `status>=500`, `user=bob`, `msg~time.?out`,
+    /// `err!=`, `trace_id?`.
+    pub fn parse(expr: &str) -> Result<Self> {
+        let expr = expr.trim();
+        let bad = |m: &str| Error::FilterExpr {
+            expr: expr.to_string(),
+            message: m.to_string(),
+        };
+        // Longest operators first.
+        const OPS: &[(&str, Op)] = &[
+            ("!=", Op::Ne),
+            ("!~", Op::NotMatch),
+            ("<=", Op::Le),
+            (">=", Op::Ge),
+            ("==", Op::Eq),
+            ("=", Op::Eq),
+            ("<", Op::Lt),
+            (">", Op::Gt),
+            ("~", Op::Match),
+        ];
+        if let Some(key) = expr.strip_suffix('?') {
+            if key.is_empty() {
+                return Err(bad("missing key"));
+            }
+            return Ok(Self {
+                key: key.to_string(),
+                op: Op::Exists,
+                value: String::new(),
+                number: None,
+                regex: None,
+            });
+        }
+        let mut found: Option<(usize, &str, Op)> = None;
+        for (tok, op) in OPS {
+            if let Some(pos) = expr.find(tok) {
+                if pos == 0 {
+                    continue;
+                }
+                match found {
+                    Some((p, _, _)) if p <= pos => {}
+                    _ => found = Some((pos, tok, *op)),
+                }
+            }
+        }
+        let Some((pos, tok, op)) = found else {
+            return Err(bad(
+                "expected key=value, key!=value, key~regex, key<n, key>=n or key?",
+            ));
+        };
+        let key = expr[..pos].trim().to_string();
+        let value = expr[pos + tok.len()..].trim().to_string();
+        if key.is_empty() {
+            return Err(bad("missing key"));
+        }
+        let regex = match op {
+            Op::Match | Op::NotMatch => Some(
+                regex::RegexBuilder::new(&value)
+                    .case_insensitive(!value.chars().any(|c| c.is_uppercase()))
+                    .build()
+                    .map_err(|e| Error::Regex {
+                        pattern: value.clone(),
+                        message: e.to_string(),
+                    })?,
+            ),
+            _ => None,
+        };
+        let number = value.parse::<f64>().ok();
+        Ok(Self {
+            key,
+            op,
+            value,
+            number,
+            regex,
+        })
+    }
+
 }
 
 /// A template token: literal text or a wildcard.
@@ -97,3 +177,20 @@ pub struct Filter {
     pub spec: FilterSpec,
 }
 
+impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty()
+            && self.exclude.is_empty()
+            && self.min_level.is_none()
+            && self.since.is_none()
+            && self.until.is_none()
+            && self.fields.is_empty()
+            && self.template.is_none()
+    }
+
+    /// Whether evaluating this filter needs timestamp / level metadata.
+    pub fn needs_meta(&self) -> bool {
+        self.min_level.is_some() || self.since.is_some() || self.until.is_some()
+    }
+
+}
