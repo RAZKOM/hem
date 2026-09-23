@@ -24,6 +24,12 @@ impl LineIndex {
         Self::default()
     }
 
+    /// Reset to the empty state (used on truncation / rotation).
+    pub fn clear(&mut self) {
+        self.offsets.clear();
+        self.scanned = 0;
+    }
+
     /// Bytes scanned so far.
     pub fn scanned(&self) -> u64 {
         self.scanned

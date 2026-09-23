@@ -57,4 +57,15 @@ impl MetaCache {
         self.map.lock().get(&(generation, line)).copied()
     }
 
+    pub fn insert(&self, generation: u32, line: u64, meta: LineMeta) {
+        let mut m = self.map.lock();
+        if m.len() >= self.cap {
+            m.clear();
+        }
+        m.insert((generation, line), meta);
+    }
+
+    pub fn clear(&self) {
+        self.map.lock().clear();
+    }
 }

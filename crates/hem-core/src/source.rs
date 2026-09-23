@@ -125,6 +125,10 @@ impl std::fmt::Debug for SourceGuard<'_> {
 }
 
 impl SourceGuard<'_> {
+    pub fn data(&self) -> &[u8] {
+        &self.guard.data
+    }
+
     /// A reference-counted handle to the current data buffer, for background
     /// jobs that want to scan without holding the lock.
     pub fn data_arc(&self) -> Arc<Data> {

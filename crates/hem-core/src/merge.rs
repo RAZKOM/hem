@@ -3,6 +3,7 @@
 //! line's timestamp in the same source, so multi-line entries (stack
 //! traces) stay together.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -39,6 +40,12 @@ impl Drop for Merged {
     }
 }
 
+fn combined_generation(sources: &[Source]) -> u32 {
+    sources.iter().fold(0u32, |acc, s| {
+        acc.wrapping_mul(31).wrapping_add(s.generation())
+    })
+}
+
 impl Merged {
     pub fn len(&self) -> usize {
         self.rows.read().len()
@@ -54,6 +61,10 @@ impl Merged {
         rows[a.min(b)..b].to_vec()
     }
 
+    pub fn row(&self, i: usize) -> Option<Row> {
+        self.rows.read().get(i).copied()
+    }
+
     pub fn generation(&self) -> u32 {
         self.generation.load(Ordering::Acquire)
     }
@@ -65,5 +76,17 @@ impl Merged {
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
         self.wakers.lock().push(w);
     }
+
+    fn wake(&self) {
+        for w in self.wakers.lock().iter() {
+            w();
+        }
+    }
+}
+
+struct Cursor {
+    next_line: usize,
+    carry_ts: i64,
+    pending: VecDeque<(i64, u64)>,
 }
 

@@ -313,6 +313,26 @@ pub fn parse_at(buf: &[u8], at: usize, default_year: i64) -> Option<Ts> {
     }
 }
 
+/// How many leading bytes of a line are scanned for a timestamp.
+const SCAN_LIMIT: usize = 160;
+
+/// Scan the beginning of a line for a timestamp in any supported format.
+pub fn find(line: &[u8], default_year: i64) -> Option<Ts> {
+    let limit = line.len().min(SCAN_LIMIT);
+    let mut i = 0;
+    while i < limit {
+        let b = line[i];
+        let word_start = i == 0 || !(line[i - 1].is_ascii_alphanumeric());
+        if word_start && (b.is_ascii_digit() || b.is_ascii_uppercase()) {
+            if let Some(ts) = parse_at(line, i, default_year) {
+                return Some(ts);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Current year, used for year-less syslog timestamps.
 pub fn current_year() -> i64 {
     Local::now().year() as i64

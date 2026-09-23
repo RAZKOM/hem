@@ -47,6 +47,10 @@ impl Search {
         self.0.matches.read().len()
     }
 
+    pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
+        self.0.wakers.lock().push(w);
+    }
+
     /// Whether row `row` is a match.
     pub fn contains(&self, row: usize) -> bool {
         self.0.matches.read().binary_search(&(row as u64)).is_ok()

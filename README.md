@@ -21,3 +21,11 @@ say, and stays instant on multi-gigabyte files.
   colourised plain output when piped; sensible exit codes.
 - **Read-only.** hem never modifies the files it opens.
 
+## Formats
+
+Detected per source from a sample (override with `--format`): JSON lines,
+logfmt, nginx/Apache combined, syslog (RFC 3164/5424), plain. Timestamps are
+found in ISO 8601 / RFC 3339, `YYYY-MM-DD HH:MM:SS[,fff]`, `YYYY/MM/DD`,
+syslog, Apache/nginx bracket form and epoch seconds/millis/micros/nanos
+(including JSON `time`/`ts`/`timestamp`/`@timestamp` fields).
+
