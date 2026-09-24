@@ -1,7 +1,35 @@
 //! Structured field extraction for JSON, logfmt, nginx and syslog lines.
 
+use crate::format::Format;
+
 /// A flattened `(key, value)` pair.  Nested JSON keys are joined with `.`.
 pub type Field = (String, String);
+
+/// Extract fields from a line according to its format.  Plain lines yield
+/// nothing.  Never panics on malformed input.
+pub fn extract(line: &[u8], format: Format) -> Vec<Field> {
+    match format {
+        Format::Json => json_fields(line),
+        Format::Logfmt => logfmt_fields(line),
+        Format::Nginx => nginx_fields(line),
+        Format::Syslog => syslog_fields(line),
+        Format::Plain => Vec::new(),
+    }
+}
+
+/// Fast path: fetch a single top-level value by key without building the
+/// whole field list.  Works for JSON (string / number / bool values) and
+/// logfmt.
+pub fn get<'a>(line: &'a [u8], format: Format, key: &str) -> Option<std::borrow::Cow<'a, str>> {
+    match format {
+        Format::Json => json_get(line, key),
+        Format::Logfmt => logfmt_get(line, key).map(String::from_utf8_lossy),
+        _ => extract(line, format)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| std::borrow::Cow::Owned(v)),
+    }
+}
 
 pub fn json_fields(line: &[u8]) -> Vec<Field> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -299,3 +327,43 @@ pub fn nginx_fields(line: &[u8]) -> Vec<Field> {
     out
 }
 
+/// RFC 3164-ish syslog: `Oct 13 10:02:11 host app[pid]: message`.
+pub fn syslog_fields(line: &[u8]) -> Vec<Field> {
+    let s = String::from_utf8_lossy(line);
+    let mut out = Vec::new();
+    let mut rest: &str = &s;
+    if rest.starts_with('<') {
+        if let Some(end) = rest.find('>') {
+            out.push(("pri".into(), rest[1..end].to_string()));
+            rest = &rest[end + 1..];
+        }
+    }
+    // Timestamp: "Mon DD HH:MM:SS" = 15 chars, or an ISO timestamp word.
+    let t = rest.trim_start();
+    let ts_len = if t.len() >= 15 && t.as_bytes()[3] == b' ' && t.as_bytes()[9] == b':' {
+        15
+    } else {
+        t.find(' ').unwrap_or(t.len())
+    };
+    if ts_len > 0 {
+        out.push(("time".into(), t[..ts_len].to_string()));
+    }
+    rest = &t[ts_len..];
+    let mut words = rest.trim_start().splitn(3, ' ');
+    if let Some(h) = words.next() {
+        out.push(("host".into(), h.to_string()));
+    }
+    if let Some(tag) = words.next() {
+        let tag = tag.trim_end_matches(':');
+        if let Some(b) = tag.find('[') {
+            out.push(("app".into(), tag[..b].to_string()));
+            out.push(("pid".into(), tag[b + 1..].trim_end_matches(']').to_string()));
+        } else {
+            out.push(("app".into(), tag.to_string()));
+        }
+    }
+    if let Some(msg) = words.next() {
+        out.push(("msg".into(), msg.trim_start().to_string()));
+    }
+    out
+}

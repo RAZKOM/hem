@@ -43,12 +43,24 @@ impl Drop for Inner {
 }
 
 impl Search {
+    pub fn pattern(&self) -> &str {
+        &self.0.matcher.text
+    }
+
     pub fn count(&self) -> usize {
         self.0.matches.read().len()
     }
 
+    pub fn is_complete(&self) -> bool {
+        self.0.complete.load(Ordering::Acquire)
+    }
+
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
         self.0.wakers.lock().push(w);
+    }
+
+    pub fn matches(&self) -> Vec<u64> {
+        self.0.matches.read().clone()
     }
 
     /// Whether row `row` is a match.
@@ -56,5 +68,10 @@ impl Search {
         self.0.matches.read().binary_search(&(row as u64)).is_ok()
     }
 
+    fn wake(&self) {
+        for w in self.0.wakers.lock().iter() {
+            w();
+        }
+    }
 }
 

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::fields;
 use crate::format::Format;
 use crate::level::Level;
 
@@ -13,6 +14,13 @@ pub struct Matcher {
     pub text: String,
     pub regex: regex::bytes::Regex,
     pub literal: bool,
+}
+
+impl Matcher {
+    #[inline]
+    pub fn is_match(&self, line: &[u8]) -> bool {
+        self.regex.is_match(line)
+    }
 }
 
 /// Comparison operator in a field predicate.
@@ -30,6 +38,22 @@ pub enum Op {
     NotMatch,
     /// Key exists.
     Exists,
+}
+
+impl Op {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Op::Eq => "=",
+            Op::Ne => "!=",
+            Op::Lt => "<",
+            Op::Le => "<=",
+            Op::Gt => ">",
+            Op::Ge => ">=",
+            Op::Match => "~",
+            Op::NotMatch => "!~",
+            Op::Exists => "?",
+        }
+    }
 }
 
 /// `key op value` predicate over structured fields.
@@ -119,6 +143,42 @@ impl FieldPredicate {
         })
     }
 
+    pub fn matches(&self, line: &[u8], format: Format) -> bool {
+        let Some(v) = fields::get(line, format, &self.key) else {
+            return matches!(self.op, Op::Ne | Op::NotMatch) && !self.value.is_empty();
+        };
+        let v: &str = &v;
+        match self.op {
+            Op::Exists => true,
+            Op::Eq => cmp_eq(v, &self.value, self.number),
+            Op::Ne => !cmp_eq(v, &self.value, self.number),
+            Op::Match => self.regex.as_ref().map(|r| r.is_match(v)).unwrap_or(false),
+            Op::NotMatch => self.regex.as_ref().map(|r| !r.is_match(v)).unwrap_or(false),
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                let ord = match (v.parse::<f64>().ok(), self.number) {
+                    (Some(a), Some(b)) => a.partial_cmp(&b),
+                    _ => Some(v.cmp(self.value.as_str())),
+                };
+                let Some(ord) = ord else { return false };
+                match self.op {
+                    Op::Lt => ord.is_lt(),
+                    Op::Le => ord.is_le(),
+                    Op::Gt => ord.is_gt(),
+                    _ => ord.is_ge(),
+                }
+            }
+        }
+    }
+}
+
+fn cmp_eq(v: &str, want: &str, want_num: Option<f64>) -> bool {
+    if v == want {
+        return true;
+    }
+    if let (Some(n), Ok(m)) = (want_num, v.parse::<f64>()) {
+        return n == m;
+    }
+    v.eq_ignore_ascii_case(want)
 }
 
 /// A template token: literal text or a wildcard.
@@ -193,4 +253,13 @@ impl Filter {
         self.min_level.is_some() || self.since.is_some() || self.until.is_some()
     }
 
+    /// Number of active criteria (for the status bar).
+    pub fn count(&self) -> usize {
+        self.include.len()
+            + self.exclude.len()
+            + usize::from(self.min_level.is_some())
+            + usize::from(self.since.is_some() || self.until.is_some())
+            + self.fields.len()
+            + usize::from(self.template.is_some())
+    }
 }

@@ -6,6 +6,9 @@ use crate::level::Level;
 /// Fixed internal resolution; the UI resamples to its height.
 pub const BUCKETS: usize = 2048;
 
+/// Slot index for lines without a level.
+pub const NO_LEVEL: usize = Level::COUNT;
+
 /// Counts per level (plus "no level") in one bucket.
 pub type Counts = [u32; Level::COUNT + 1];
 
@@ -61,6 +64,56 @@ impl Histogram {
         self.counts.fill([0; Level::COUNT + 1]);
         self.used = 0;
         self.total = 0;
+    }
+
+    /// Bucket index for a key (timestamp or row), folding the histogram if
+    /// the key lies beyond the current range.
+    fn bucket_for(&mut self, key: i64) -> usize {
+        loop {
+            let idx = match self.axis {
+                Axis::Time { start, bucket_ms } => {
+                    if key < start {
+                        return 0;
+                    }
+                    ((key - start) / bucket_ms) as u64
+                }
+                Axis::Position { bucket_rows } => (key.max(0) as u64) / bucket_rows,
+            };
+            if (idx as usize) < BUCKETS {
+                return idx as usize;
+            }
+            self.fold();
+        }
+    }
+
+    /// Halve the resolution: merge bucket pairs so the range doubles.
+    fn fold(&mut self) {
+        for i in 0..BUCKETS / 2 {
+            let a = self.counts[2 * i];
+            let b = self.counts[2 * i + 1];
+            let mut m = [0u32; Level::COUNT + 1];
+            for k in 0..=Level::COUNT {
+                m[k] = a[k].saturating_add(b[k]);
+            }
+            self.counts[i] = m;
+        }
+        self.counts[BUCKETS / 2..].fill([0; Level::COUNT + 1]);
+        self.used /= 2;
+        match &mut self.axis {
+            Axis::Time { bucket_ms, .. } => *bucket_ms = bucket_ms.saturating_mul(2),
+            Axis::Position { bucket_rows } => *bucket_rows = bucket_rows.saturating_mul(2),
+        }
+    }
+
+    /// Record one line.
+    pub fn add(&mut self, key: i64, level: Option<Level>) {
+        let b = self.bucket_for(key);
+        let slot = level.map(|l| l.index()).unwrap_or(NO_LEVEL);
+        self.counts[b][slot] = self.counts[b][slot].saturating_add(1);
+        if b >= self.used {
+            self.used = b + 1;
+        }
+        self.total += 1;
     }
 
 }

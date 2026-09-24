@@ -48,6 +48,13 @@ impl Row {
         ((self.0 >> 40) & 0xFF) as u8
     }
 
+    pub fn count(self) -> u32 {
+        ((self.0 >> 48) & 0xFFFF) as u32
+    }
+
+    pub fn with_count(self, count: u32) -> Self {
+        Row::new(self.line(), self.source(), count)
+    }
 }
 
 /// A batch of rows with their bytes, detached from the source locks.
@@ -340,6 +347,16 @@ impl View {
             c.first = a;
             c
         }
+    }
+
+    /// True when every base row currently available has been processed.
+    pub fn is_complete(&self) -> bool {
+        self.0.complete.load(Ordering::Acquire)
+    }
+
+    /// True once the builder has exited (finite input fully processed).
+    pub fn is_finished(&self) -> bool {
+        self.0.finished.load(Ordering::Acquire)
     }
 
     pub fn generation(&self) -> u32 {

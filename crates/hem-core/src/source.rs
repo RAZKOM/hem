@@ -135,6 +135,10 @@ impl SourceGuard<'_> {
         Arc::clone(&self.guard.data)
     }
 
+    pub fn index(&self) -> &LineIndex {
+        &self.guard.index
+    }
+
     pub fn generation(&self) -> u32 {
         self.guard.generation
     }
@@ -163,6 +167,10 @@ impl SourceGuard<'_> {
         self.guard.index.span(i, &self.guard.data)
     }
 
+    pub fn line_at_offset(&self, offset: u64) -> usize {
+        self.guard.index.line_at(offset)
+    }
+
     /// Push `(start, len)` spans (without terminators) for lines `a..b`.
     pub fn spans_into(&self, a: usize, b: usize, out: &mut Vec<(u64, u32)>) {
         let data = &self.guard.data;
@@ -178,6 +186,28 @@ impl SourceGuard<'_> {
 }
 
 impl Source {
+    /// Append bytes to an in-memory source (tests / pasted input).
+    pub fn append_bytes(&self, bytes: &[u8]) {
+        let mut st = self.0.state.write();
+        let mut v = match Arc::try_unwrap(std::mem::replace(&mut st.data, Arc::new(Data::Empty))) {
+            Ok(Data::Vec(v)) => v,
+            Ok(other) => other.to_vec(),
+            Err(arc) => arc.to_vec(),
+        };
+        v.extend_from_slice(bytes);
+        st.index.extend_from(&v);
+        let len = v.len() as u64;
+        st.data = Arc::new(Data::Vec(v));
+        self.0.stats.indexed_bytes.store(len, Ordering::Release);
+        self.0.stats.total_bytes.store(len, Ordering::Release);
+        self.0
+            .stats
+            .line_count
+            .store(st.index.line_count(), Ordering::Release);
+        drop(st);
+        self.0.wake();
+    }
+
     pub fn name(&self) -> &str {
         &self.0.name
     }
@@ -233,11 +263,41 @@ impl Source {
         }
     }
 
+    /// Ask the follower to re-check the file immediately.
+    pub fn poke(&self) {
+        self.0.poke();
+    }
+
+    /// Stop background threads.  Called automatically on drop of the last
+    /// handle, but can be called earlier.
+    pub fn stop(&self) {
+        self.0.stop.store(true, Ordering::Release);
+        self.0.poke();
+    }
+
+    /// Override the format at runtime.
+    pub fn set_format(&self, format: Option<Format>) {
+        *self.0.format.lock() = format;
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+    }
+}
+
+impl Inner {
+    fn wake(&self) {
+        for w in self.wakers.lock().iter() {
+            w();
+        }
+    }
+
+    fn poke(&self) {
+        if let Some(tx) = self.poke.lock().as_ref() {
+            let _ = tx.send(());
+        }
     }
 }
 

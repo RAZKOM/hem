@@ -30,6 +30,47 @@ impl Format {
         }
     }
 
+    /// Guess the format from a sample of lines.  Requires a clear majority
+    /// so that a few JSON lines inside a plain log do not flip the whole
+    /// source.
+    pub fn detect(sample: &[&[u8]]) -> Format {
+        let lines: Vec<&[u8]> = sample
+            .iter()
+            .copied()
+            .filter(|l| !l.iter().all(|b| b.is_ascii_whitespace()))
+            .collect();
+        if lines.is_empty() {
+            return Format::Plain;
+        }
+        let n = lines.len();
+        let mut json = 0;
+        let mut logfmt = 0;
+        let mut nginx = 0;
+        let mut syslog = 0;
+        for l in &lines {
+            if looks_json(l) {
+                json += 1;
+            } else if looks_nginx(l) {
+                nginx += 1;
+            } else if looks_syslog(l) {
+                syslog += 1;
+            } else if looks_logfmt(l) {
+                logfmt += 1;
+            }
+        }
+        let majority = |c: usize| c * 2 > n;
+        if majority(json) {
+            Format::Json
+        } else if majority(nginx) {
+            Format::Nginx
+        } else if majority(syslog) {
+            Format::Syslog
+        } else if majority(logfmt) {
+            Format::Logfmt
+        } else {
+            Format::Plain
+        }
+    }
 }
 
 impl std::fmt::Display for Format {
@@ -50,6 +91,112 @@ impl std::str::FromStr for Format {
             other => return Err(crate::Error::UnknownFormat(other.to_string())),
         })
     }
+}
+
+fn trim(l: &[u8]) -> &[u8] {
+    let s = l
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(l.len());
+    let e = l
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(s);
+    &l[s..e.max(s)]
+}
+
+pub(crate) fn looks_json(l: &[u8]) -> bool {
+    let t = trim(l);
+    t.len() >= 2 && t[0] == b'{' && t[t.len() - 1] == b'}'
+}
+
+pub(crate) fn looks_logfmt(l: &[u8]) -> bool {
+    // Count `key=` tokens at token starts; need at least two and the first
+    // token must be one of them.
+    let mut pairs = 0;
+    let mut first_ok = false;
+    let mut i = 0;
+    let mut first = true;
+    while i < l.len() {
+        while i < l.len() && l[i] == b' ' {
+            i += 1;
+        }
+        let start = i;
+        let mut key_ok = false;
+        while i < l.len() && l[i] != b' ' {
+            if l[i] == b'=' && i > start && !key_ok {
+                let key = &l[start..i];
+                key_ok = key
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'@'));
+                if key_ok {
+                    pairs += 1;
+                    if first {
+                        first_ok = true;
+                    }
+                }
+            }
+            if l[i] == b'"' {
+                // skip quoted value
+                i += 1;
+                while i < l.len() && l[i] != b'"' {
+                    if l[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+        first = false;
+    }
+    pairs >= 2 && first_ok
+}
+
+pub(crate) fn looks_nginx(l: &[u8]) -> bool {
+    // <addr> <ident> <user> [<time>] "<request>" <status> ...
+    let mut fields = 0;
+    let mut i = 0;
+    while fields < 3 {
+        while i < l.len() && l[i] != b' ' {
+            i += 1;
+        }
+        if i >= l.len() {
+            return false;
+        }
+        fields += 1;
+        i += 1;
+    }
+    l.get(i) == Some(&b'[')
+        && l[i..]
+            .iter()
+            .position(|&b| b == b']')
+            .map(|p| l.get(i + p + 2) == Some(&b'"'))
+            .unwrap_or(false)
+}
+
+pub(crate) fn looks_syslog(l: &[u8]) -> bool {
+    if l.first() == Some(&b'<') {
+        // RFC 5424 / 3164 with PRI.
+        if let Some(close) = l.iter().take(6).position(|&b| b == b'>') {
+            return close >= 2 && l[1..close].iter().all(|b| b.is_ascii_digit());
+        }
+    }
+    // "Oct 13 10:02:11 host app[pid]: msg"
+    if l.len() < 16 {
+        return false;
+    }
+    let month = l[0].is_ascii_uppercase() && l[1].is_ascii_lowercase() && l[2].is_ascii_lowercase();
+    month
+        && l[3] == b' '
+        && (l[4].is_ascii_digit() || l[4] == b' ')
+        && l[5].is_ascii_digit()
+        && l[6] == b' '
+        && l[7].is_ascii_digit()
+        && l[9] == b':'
+        && l[12] == b':'
+        && l[15] == b' '
 }
 
 #[cfg(test)]

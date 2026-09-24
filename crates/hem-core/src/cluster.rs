@@ -11,10 +11,38 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::collapse::normalize;
 use crate::filter::Token;
 use crate::format::Format;
 use crate::level::Level;
 use crate::view::{Base, Row};
+
+const MAX_TOKENS: usize = 48;
+const MAX_TOKEN_LEN: usize = 48;
+
+/// Fields that carry the human-readable message in structured logs.
+const MSG_KEYS: &[&str] = &["msg", "message", "event", "error", "err", "text", "log"];
+
+fn tokenize_text(text: &[u8]) -> Vec<String> {
+    let norm = normalize(&text[..text.len().min(2048)]);
+    let s = String::from_utf8_lossy(&norm);
+    s.split_whitespace()
+        .take(MAX_TOKENS)
+        .map(|t| {
+            if t.contains('#') {
+                "<*>".to_string()
+            } else if t.len() > MAX_TOKEN_LEN {
+                let mut cut = MAX_TOKEN_LEN;
+                while !t.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                t[..cut].to_string()
+            } else {
+                t.to_string()
+            }
+        })
+        .collect()
+}
 
 /// A mined template.
 #[derive(Debug, Clone)]
@@ -65,12 +93,153 @@ impl Miner {
         }
     }
 
+    pub fn templates(&self) -> &[Template] {
+        &self.templates
+    }
+
     pub fn len(&self) -> usize {
         self.templates.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.templates.is_empty()
+    }
+
+    /// Add a tokenised line; returns the template id.
+    pub fn add(
+        &mut self,
+        tokens: &[String],
+        format: Format,
+        row: Row,
+        level: Option<Level>,
+        ts: Option<i64>,
+    ) -> usize {
+        let n = tokens.len();
+        let mut node = self.roots.entry(n).or_default();
+        // Route on the first `depth` non-wildcard tokens (timestamps at the
+        // start of a line are wildcards and would otherwise be useless keys).
+        let path: Vec<&String> = tokens
+            .iter()
+            .filter(|t| *t != "<*>")
+            .take(self.depth)
+            .collect();
+        for tok in path {
+            let key: &str = tok;
+            if !node.children.contains_key(key) {
+                if node.children.len() >= self.max_children && key != "<*>" {
+                    node = node.children.entry("<*>".to_string()).or_default();
+                    continue;
+                }
+                node.children.insert(key.to_string(), Node::default());
+            }
+            node = node.children.get_mut(key).expect("just inserted");
+        }
+        // Best matching template at this leaf.
+        let mut best: Option<(usize, f64)> = None;
+        for &id in &node.clusters {
+            let t = &self.templates[id];
+            let same = t
+                .tokens
+                .iter()
+                .zip(tokens)
+                .filter(|(a, b)| matches!(a, Token::Lit(s) if s == *b))
+                .count();
+            let sim = if n == 0 { 1.0 } else { same as f64 / n as f64 };
+            if best.map(|(_, b)| sim > b).unwrap_or(true) {
+                best = Some((id, sim));
+            }
+        }
+        let force = self.templates.len() >= self.max_templates;
+        let id = match best {
+            Some((id, sim))
+                if sim >= self.sim_threshold || (force && !node.clusters.is_empty()) =>
+            {
+                let t = &mut self.templates[id];
+                for (a, b) in t.tokens.iter_mut().zip(tokens) {
+                    if matches!(a, Token::Lit(s) if s != b) {
+                        *a = Token::Wild;
+                    }
+                }
+                id
+            }
+            _ if force => {
+                // Out of template budget: lump into a catch-all per length.
+                let key = n;
+                match self.templates.iter().position(|t| {
+                    t.tokens.len() == key && t.tokens.iter().all(|t| *t == Token::Wild)
+                }) {
+                    Some(id) => id,
+                    None => {
+                        // Degrade the most recent template at this leaf.
+                        match node.clusters.last().copied() {
+                            Some(id) => {
+                                for a in self.templates[id].tokens.iter_mut() {
+                                    *a = Token::Wild;
+                                }
+                                id
+                            }
+                            None => {
+                                let id = self.templates.len();
+                                self.templates.push(Template {
+                                    id,
+                                    format,
+                                    tokens: tokens.iter().map(|_| Token::Wild).collect(),
+                                    count: 0,
+                                    levels: [0; Level::COUNT + 1],
+                                    first: row,
+                                    last: row,
+                                    first_ts: ts,
+                                    last_ts: ts,
+                                    examples: Vec::new(),
+                                });
+                                node.clusters.push(id);
+                                id
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                let id = self.templates.len();
+                self.templates.push(Template {
+                    id,
+                    format,
+                    tokens: tokens
+                        .iter()
+                        .map(|t| {
+                            if t == "<*>" {
+                                Token::Wild
+                            } else {
+                                Token::Lit(t.clone())
+                            }
+                        })
+                        .collect(),
+                    count: 0,
+                    levels: [0; Level::COUNT + 1],
+                    first: row,
+                    last: row,
+                    first_ts: ts,
+                    last_ts: ts,
+                    examples: Vec::new(),
+                });
+                node.clusters.push(id);
+                id
+            }
+        };
+        let t = &mut self.templates[id];
+        t.count += 1;
+        t.levels[level.map(|l| l.index()).unwrap_or(Level::COUNT)] += 1;
+        t.last = row;
+        if ts.is_some() {
+            if t.first_ts.is_none() {
+                t.first_ts = ts;
+            }
+            t.last_ts = ts;
+        }
+        if t.examples.len() < 3 {
+            t.examples.push(row);
+        }
+        id
     }
 }
 
@@ -113,6 +282,12 @@ impl Clusters {
 
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
         self.0.wakers.lock().push(w);
+    }
+
+    fn wake(&self) {
+        for w in self.0.wakers.lock().iter() {
+            w();
+        }
     }
 }
 

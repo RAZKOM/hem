@@ -7,6 +7,9 @@
 //! * double- or single-quoted strings with `"#"`;
 //! * runs of whitespace with a single space.
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 #[inline]
 fn is_hexish(b: u8) -> bool {
     b.is_ascii_hexdigit()
@@ -100,6 +103,16 @@ pub fn normalize(line: &[u8]) -> Vec<u8> {
         out.pop();
     }
     out
+}
+
+/// 64-bit hash of the normalised form, without allocating.
+pub fn shape_hash(line: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    normalize_into(line, |b| {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    });
+    h
 }
 
 #[cfg(test)]

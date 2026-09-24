@@ -19,7 +19,23 @@ pub enum Level {
 }
 
 impl Level {
+    pub const ALL: [Level; 6] = [
+        Level::Trace,
+        Level::Debug,
+        Level::Info,
+        Level::Warn,
+        Level::Error,
+        Level::Fatal,
+    ];
     pub const COUNT: usize = 6;
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> Option<Level> {
+        Level::ALL.get(i).copied()
+    }
 
     /// Canonical upper-case name.
     pub fn as_str(self) -> &'static str {
@@ -98,6 +114,10 @@ fn matcher() -> &'static AhoCorasick {
 
 /// Maximum number of bytes scanned for a level keyword.
 const SCAN_LIMIT: usize = 4096;
+
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
 
 #[cfg(test)]
 mod tests {
