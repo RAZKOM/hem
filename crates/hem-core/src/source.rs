@@ -275,6 +275,30 @@ impl Source {
         self.0.poke();
     }
 
+    /// The detected (or overridden) line format.  Detection samples the
+    /// first lines once at least a handful are available and then caches
+    /// the result.
+    pub fn format(&self) -> Format {
+        if let Some(f) = self.0.format_override {
+            return f;
+        }
+        if let Some(f) = *self.0.format.lock() {
+            return f;
+        }
+        let guard = self.read();
+        let n = guard.line_count();
+        if n == 0 {
+            return Format::Plain;
+        }
+        let sample: Vec<&[u8]> = (0..n.min(200)).filter_map(|i| guard.line(i)).collect();
+        let f = Format::detect(&sample);
+        // Only cache once we have a decent sample or the input is finished.
+        if n >= 20 || self.is_complete() {
+            *self.0.format.lock() = Some(f);
+        }
+        f
+    }
+
     /// Override the format at runtime.
     pub fn set_format(&self, format: Option<Format>) {
         *self.0.format.lock() = format;

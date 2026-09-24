@@ -11,10 +11,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::filter::Filter;
+use crate::format::Format;
 use crate::level::Level;
 use crate::merge::Merged;
 use crate::source::{Data, Source};
@@ -54,6 +56,10 @@ impl Row {
 
     pub fn with_count(self, count: u32) -> Self {
         Row::new(self.line(), self.source(), count)
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
     }
 }
 
@@ -156,6 +162,10 @@ impl Base {
             Base::Single(s) => s.is_live(),
             Base::Merged(m) => m.sources.iter().any(|s| s.is_live()),
         }
+    }
+
+    pub fn formats(&self) -> Vec<Format> {
+        self.sources().iter().map(|s| s.format()).collect()
     }
 
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
@@ -300,6 +310,14 @@ impl Drop for Inner {
 }
 
 impl View {
+    pub fn base(&self) -> &Base {
+        &self.0.base
+    }
+
+    pub fn spec(&self) -> &ViewSpec {
+        &self.0.spec
+    }
+
     pub fn is_identity(&self) -> bool {
         self.0.identity
     }
@@ -398,3 +416,30 @@ struct ChunkOut {
     saw_ts: bool,
 }
 
+/// Wait (with timeout) until the view has finished building.  For tests
+/// and plain mode.
+pub fn wait_complete(view: &View, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while !(view.is_finished() || (view.is_complete() && view.base().is_complete())) {
+        if start.elapsed() > timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_packing() {
+        let r = Row::new(123_456_789_012, 7, 70_000);
+        assert_eq!(r.line(), 123_456_789_012);
+        assert_eq!(r.source(), 7);
+        assert_eq!(r.count(), 0xFFFF);
+        assert_eq!(r.with_count(3).count(), 3);
+    }
+
+}

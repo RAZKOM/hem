@@ -119,6 +119,38 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Find the level keyword in a line.  Returns the level and the byte span
+/// of the keyword.
+///
+/// Upper-case keywords (`ERROR`) are accepted anywhere.  Lower- or
+/// mixed-case keywords (`error`, `Error`) are only accepted at the start of
+/// the line or directly after a structural prefix (`[`, `<`, `=`, `:`,
+/// `"`, `'`) so that prose such as "connection error" does not mark a line.
+pub fn detect(line: &[u8]) -> Option<(Level, usize, usize)> {
+    let hay = &line[..line.len().min(SCAN_LIMIT)];
+    for m in matcher().find_iter(hay) {
+        let (s, e) = (m.start(), m.end());
+        if s > 0 && is_word(hay[s - 1]) {
+            continue;
+        }
+        if e < hay.len() && is_word(hay[e]) {
+            continue;
+        }
+        let word = &hay[s..e];
+        let upper = word.iter().all(|b| b.is_ascii_uppercase());
+        if !upper {
+            let prev = if s == 0 { b' ' } else { hay[s - 1] };
+            let ok = s == 0 || matches!(prev, b'[' | b'<' | b'=' | b':' | b'"' | b'\'' | b'(');
+            if !ok {
+                continue;
+            }
+        }
+        let level = KEYWORDS[m.pattern().as_usize()].1;
+        return Some((level, s, e));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

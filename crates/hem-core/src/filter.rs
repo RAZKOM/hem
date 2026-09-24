@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::fields;
 use crate::format::Format;
 use crate::level::Level;
+use crate::parse::LineMeta;
 
 /// A compiled text pattern.
 #[derive(Debug, Clone)]
@@ -195,6 +196,19 @@ pub struct TemplateMatch {
     pub format: Format,
 }
 
+impl TemplateMatch {
+    pub fn matches(&self, line: &[u8]) -> bool {
+        let toks = crate::cluster::tokenize(line, self.format);
+        if toks.len() != self.tokens.len() {
+            return false;
+        }
+        toks.iter().zip(&self.tokens).all(|(a, b)| match b {
+            Token::Wild => true,
+            Token::Lit(s) => a == s,
+        })
+    }
+}
+
 /// Serialisable description of a filter (what the user typed / configured).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -261,5 +275,50 @@ impl Filter {
             + usize::from(self.since.is_some() || self.until.is_some())
             + self.fields.len()
             + usize::from(self.template.is_some())
+    }
+
+    /// Evaluate against a line.  `meta` must already have inherited values
+    /// from preceding lines (see [`crate::view`]).
+    pub fn matches(&self, line: &[u8], meta: &LineMeta, format: Format) -> bool {
+        if let Some(min) = self.min_level {
+            match meta.level {
+                Some(l) if l >= min => {}
+                _ => return false,
+            }
+        }
+        if self.since.is_some() || self.until.is_some() {
+            let Some(ts) = meta.ts else { return false };
+            if let Some(s) = self.since {
+                if ts < s {
+                    return false;
+                }
+            }
+            if let Some(u) = self.until {
+                if ts > u {
+                    return false;
+                }
+            }
+        }
+        for m in &self.exclude {
+            if m.is_match(line) {
+                return false;
+            }
+        }
+        for m in &self.include {
+            if !m.is_match(line) {
+                return false;
+            }
+        }
+        for p in &self.fields {
+            if !p.matches(line, format) {
+                return false;
+            }
+        }
+        if let Some(t) = &self.template {
+            if !t.matches(line) {
+                return false;
+            }
+        }
+        true
     }
 }

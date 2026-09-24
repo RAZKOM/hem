@@ -11,10 +11,14 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use std::borrow::Cow;
+
 use crate::collapse::normalize;
+use crate::fields;
 use crate::filter::Token;
 use crate::format::Format;
 use crate::level::Level;
+use crate::parse::parse_line;
 use crate::view::{Base, Row};
 
 const MAX_TOKENS: usize = 48;
@@ -22,6 +26,33 @@ const MAX_TOKEN_LEN: usize = 48;
 
 /// Fields that carry the human-readable message in structured logs.
 const MSG_KEYS: &[&str] = &["msg", "message", "event", "error", "err", "text", "log"];
+
+/// Tokenise a line for clustering.  Structured lines (JSON / logfmt) are
+/// clustered on their level + message field so that keys and quoted
+/// values do not swallow the whole line.
+pub fn tokenize(line: &[u8], format: Format) -> Vec<String> {
+    let line = &line[..line.len().min(4096)];
+    let text: Cow<'_, [u8]> = match format {
+        Format::Json | Format::Logfmt => {
+            let msg = MSG_KEYS.iter().find_map(|k| match format {
+                Format::Json => fields::json_get(line, k).map(|v| v.into_owned()),
+                _ => fields::logfmt_get(line, k).map(|v| String::from_utf8_lossy(v).into_owned()),
+            });
+            match msg {
+                Some(m) => {
+                    let level = crate::parse::parse_line(line, format, 1970)
+                        .level
+                        .map(|l| l.as_str())
+                        .unwrap_or("");
+                    Cow::Owned(format!("{level} {m}").into_bytes())
+                }
+                None => Cow::Borrowed(line),
+            }
+        }
+        _ => Cow::Borrowed(line),
+    };
+    tokenize_text(&text)
+}
 
 fn tokenize_text(text: &[u8]) -> Vec<String> {
     let norm = normalize(&text[..text.len().min(2048)]);
