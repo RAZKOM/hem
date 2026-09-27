@@ -5,7 +5,7 @@
 //! mutually consistent for ordering, bucketing and `--since/--until`, and
 //! the original text is what gets displayed.
 
-use chrono::{Datelike, Local, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 
 /// A detected timestamp: epoch milliseconds plus the byte span in the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,8 +333,59 @@ pub fn find(line: &[u8], default_year: i64) -> Option<Ts> {
     None
 }
 
+/// Human-friendly short form for axis labels: picks a precision suited to
+/// the span being labelled.
+pub fn format_axis(ms: i64, span_ms: i64) -> String {
+    let Some(dt) = DateTime::from_timestamp_millis(ms) else {
+        return String::new();
+    };
+    if span_ms >= 2 * 86_400_000 {
+        dt.format("%m-%d %H:%M").to_string()
+    } else if span_ms >= 60_000 {
+        dt.format("%H:%M:%S").to_string()
+    } else {
+        dt.format("%H:%M:%S%.3f").to_string()
+    }
+}
+
 /// Current year, used for year-less syslog timestamps.
 pub fn current_year() -> i64 {
     Local::now().year() as i64
 }
 
+/// Convert a `NaiveDateTime` (treated as UTC) to epoch ms.
+pub fn naive_to_ms(n: NaiveDateTime) -> i64 {
+    Utc.from_utc_datetime(&n).timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(s: &str) -> Option<i64> {
+        find(s.as_bytes(), 2026).map(|t| t.ms)
+    }
+
+    #[test]
+    fn epoch_variants() {
+        assert_eq!(ms("1791885731 x"), Some(1_791_885_731_000));
+        assert_eq!(ms("1791885731.204 x"), Some(1_791_885_731_204));
+        assert_eq!(ms("1791885731204 x"), Some(1_791_885_731_204));
+        assert_eq!(ms("1791885731204567 x"), Some(1_791_885_731_204));
+        assert_eq!(ms("1791885731204567890 x"), Some(1_791_885_731_204));
+        assert_eq!(ms("12345 x"), None);
+    }
+
+    #[test]
+    fn no_timestamp() {
+        assert_eq!(ms("hello world 42"), None);
+        assert_eq!(ms("   at com.example.Foo(Foo.java:12)"), None);
+        assert_eq!(ms(""), None);
+    }
+
+    #[test]
+    fn find_span() {
+        let t = find(b"[2026-10-13T10:02:11Z] x", 2026).unwrap();
+        assert_eq!((t.start, t.end), (1, 21));
+    }
+}

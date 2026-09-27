@@ -90,6 +90,20 @@ pub struct Template {
     pub examples: Vec<Row>,
 }
 
+impl Template {
+    /// Most common level.
+    pub fn dominant_level(&self) -> Option<Level> {
+        let (mut best, mut best_n) = (None, 0u64);
+        for (i, n) in self.levels.iter().enumerate().take(Level::COUNT) {
+            if *n > best_n {
+                best_n = *n;
+                best = Level::from_index(i);
+            }
+        }
+        best
+    }
+}
+
 #[derive(Default)]
 struct Node {
     children: HashMap<String, Node>,
@@ -322,3 +336,25 @@ impl Clusters {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenizes_with_wildcards() {
+        let t = tokenize(
+            b"User bob logged in from 10.0.0.1 (attempt 3)",
+            Format::Plain,
+        );
+        assert_eq!(
+            t,
+            vec!["User", "bob", "logged", "in", "from", "<*>", "(attempt", "<*>"]
+        );
+        let t = tokenize(
+            br#"{"level":"warn","user":"bob","msg":"slow query took 12ms"}"#,
+            Format::Json,
+        );
+        assert_eq!(t, vec!["WARN", "slow", "query", "took", "<*>"]);
+    }
+
+}

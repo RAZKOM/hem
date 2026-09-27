@@ -59,6 +59,10 @@ impl Histogram {
         matches!(self.axis, Axis::Time { .. })
     }
 
+    pub fn buckets(&self) -> &[Counts] {
+        &self.counts
+    }
+
     /// Reset counts (keep the axis).
     pub fn clear(&mut self) {
         self.counts.fill([0; Level::COUNT + 1]);
@@ -116,4 +120,85 @@ impl Histogram {
         self.total += 1;
     }
 
+    /// Bucket index containing `key` (no folding; clamped).
+    pub fn bucket_of(&self, key: i64) -> usize {
+        let idx = match self.axis {
+            Axis::Time { start, bucket_ms } => ((key - start).max(0) / bucket_ms) as usize,
+            Axis::Position { bucket_rows } => ((key.max(0) as u64) / bucket_rows) as usize,
+        };
+        idx.min(BUCKETS - 1)
+    }
+
+    /// Resample the used part of the histogram into `n` display cells,
+    /// summing counts.  Returns an empty vec if nothing was recorded.
+    pub fn resample(&self, n: usize) -> Vec<Counts> {
+        let used = self.used.max(1);
+        if n == 0 || self.total == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![[0u32; Level::COUNT + 1]; n];
+        for b in 0..used {
+            let cell = (b * n / used).min(n - 1);
+            for (k, slot) in out[cell].iter_mut().enumerate() {
+                *slot = slot.saturating_add(self.counts[b][k]);
+            }
+        }
+        out
+    }
+
+    /// First bucket at or after `from` whose counts at level `>= min` are
+    /// non-zero.  `forward=false` searches backwards.
+    pub fn next_bucket_with(&self, from: usize, min: Level, forward: bool) -> Option<usize> {
+        let hit = |c: &Counts| (min.index()..Level::COUNT).any(|k| c[k] > 0);
+        if forward {
+            (from..self.used).find(|&b| hit(&self.counts[b]))
+        } else {
+            (0..=from.min(self.used.saturating_sub(1)))
+                .rev()
+                .find(|&b| hit(&self.counts[b]))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_axis_folds() {
+        let mut h = Histogram::new_position(100);
+        for i in 0..10_000 {
+            h.add(
+                i,
+                Some(if i % 100 == 0 {
+                    Level::Error
+                } else {
+                    Level::Info
+                }),
+            );
+        }
+        assert_eq!(h.total, 10_000);
+        let cells = h.resample(10);
+        let errs: u32 = cells.iter().map(|c| c[Level::Error.index()]).sum();
+        assert_eq!(errs, 100);
+        let infos: u32 = cells.iter().map(|c| c[Level::Info.index()]).sum();
+        assert_eq!(infos, 9_900);
+        assert!(matches!(h.axis, Axis::Position { bucket_rows } if bucket_rows >= 4));
+    }
+
+    #[test]
+    fn time_axis_and_lookup() {
+        let mut h = Histogram::new_time(1_000, 1_000 + 2048 * 10);
+        h.add(1_000, Some(Level::Warn));
+        h.add(1_000 + 1000 * 10, Some(Level::Error));
+        h.add(500, None); // before range clamps to bucket 0
+        assert_eq!(h.bucket_of(1_000 + 1000 * 10), 1000);
+        assert_eq!(h.next_bucket_with(1, Level::Error, true), Some(1000));
+        assert_eq!(h.next_bucket_with(999, Level::Warn, false), Some(0));
+        assert_eq!(h.next_bucket_with(1001, Level::Error, true), None);
+        // Beyond the range: folds.
+        h.add(1_000 + 2048 * 10 * 3, Some(Level::Info));
+        assert!(matches!(h.axis, Axis::Time { bucket_ms, .. } if bucket_ms == 40));
+        assert_eq!(h.total, 4);
+    }
 }
