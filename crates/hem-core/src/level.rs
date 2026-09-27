@@ -84,6 +84,13 @@ impl std::fmt::Display for Level {
     }
 }
 
+impl std::str::FromStr for Level {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Level::parse(s).ok_or_else(|| crate::Error::UnknownLevel(s.to_string()))
+    }
+}
+
 const KEYWORDS: &[(&str, Level)] = &[
     ("TRACE", Level::Trace),
     ("DEBUG", Level::Debug),
@@ -164,4 +171,34 @@ mod tests {
         assert_eq!(Level::parse("bogus"), None);
     }
 
+    #[test]
+    fn detects_uppercase_anywhere() {
+        let l = b"2026-10-13 10:02:11 ERROR connection reset";
+        assert_eq!(detect(l), Some((Level::Error, 20, 25)));
+        assert_eq!(detect(b"[WARN] slow").map(|x| x.0), Some(Level::Warn));
+        assert_eq!(detect(b"x WARNING y").map(|x| x.0), Some(Level::Warn));
+    }
+
+    #[test]
+    fn lowercase_needs_prefix() {
+        assert_eq!(
+            detect(b"level=error msg=x").map(|x| x.0),
+            Some(Level::Error)
+        );
+        assert_eq!(
+            detect(br#"{"level":"warn","msg":"x"}"#).map(|x| x.0),
+            Some(Level::Warn)
+        );
+        assert_eq!(detect(b"a connection error happened"), None);
+        assert_eq!(detect(b"Error: boom").map(|x| x.0), Some(Level::Error));
+    }
+
+    #[test]
+    fn word_boundaries() {
+        assert_eq!(detect(b"INFORMATION about ERRORS"), None);
+        assert_eq!(
+            detect(b"debug_mode=1 INFO x").map(|x| x.0),
+            Some(Level::Info)
+        );
+    }
 }

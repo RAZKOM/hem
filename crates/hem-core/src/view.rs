@@ -306,6 +306,16 @@ struct Inner {
 #[derive(Clone)]
 pub struct View(Arc<Inner>);
 
+impl std::fmt::Debug for View {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("View")
+            .field("base", &self.0.base.name())
+            .field("rows", &self.len())
+            .field("identity", &self.0.identity)
+            .finish()
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
@@ -748,6 +758,50 @@ mod tests {
         assert_eq!(v.row(1), Some(Row::new(1, 0, 1)));
         let st = v.stats();
         assert_eq!(st.lines, 3);
+    }
+
+    #[test]
+    fn collapsed_view() {
+        let mut text = String::new();
+        text.push_str("INFO start\n");
+        for i in 0..500 {
+            text.push_str(&format!("ERROR connection reset by peer (attempt {i})\n"));
+        }
+        text.push_str("INFO end\n");
+        let v = built(
+            mem(&text),
+            ViewSpec {
+                filter: Filter::default(),
+                collapse: true,
+            },
+        );
+        let rows = v.rows(0, 10);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].count(), 500);
+        assert_eq!(rows[1].line(), 1);
+        assert_eq!(rows[2].line(), 501);
+        assert_eq!(v.row_for_line(0, 250), 1);
+        assert_eq!(v.stats().lines, 502);
+    }
+
+    #[test]
+    fn collapse_across_chunk_boundary() {
+        let n = CHUNK_ROWS * 2 + 10;
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!("same line {i}\n"));
+        }
+        let v = built(
+            mem(&text),
+            ViewSpec {
+                filter: Filter::default(),
+                collapse: true,
+            },
+        );
+        let rows = v.rows(0, 10);
+        // 65546 lines collapse into ceil(n / 65535) rows.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].count() as usize + rows[1].count() as usize, n);
     }
 
 }

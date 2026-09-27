@@ -9,17 +9,21 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 use crate::error::{Error, Result};
 use crate::format::Format;
-use crate::index::LineIndex;
+use crate::index::{scan_offsets, LineIndex};
+
+/// Chunk size for background scanning; each chunk becomes one batch of
+/// offsets appended under the write lock.
+const SCAN_CHUNK: usize = 32 * 1024 * 1024;
 
 /// Raw bytes of a source.
 pub enum Data {
@@ -259,6 +263,10 @@ impl Source {
         &self.0.name
     }
 
+    pub fn path(&self) -> Option<&Path> {
+        self.0.path.as_deref()
+    }
+
     /// Acquire a read guard over the current data and index.
     pub fn read(&self) -> SourceGuard<'_> {
         SourceGuard {
@@ -381,6 +389,11 @@ impl Inner {
         }
     }
 
+    fn push_notice(&self, n: Notice) {
+        self.notices.lock().push(n);
+        self.wake();
+    }
+
     fn wake(&self) {
         for w in self.wakers.lock().iter() {
             w();
@@ -392,5 +405,247 @@ impl Inner {
             let _ = tx.send(());
         }
     }
+
+    fn reset(&self, notice: Notice) {
+        {
+            let mut st = self.state.write();
+            st.data = Arc::new(Data::Empty);
+            st.index.clear();
+            st.generation = st.generation.wrapping_add(1);
+            self.stats
+                .generation
+                .store(st.generation, Ordering::Release);
+        }
+        self.stats.indexed_bytes.store(0, Ordering::Release);
+        self.stats.total_bytes.store(0, Ordering::Release);
+        self.stats.line_count.store(0, Ordering::Release);
+        self.stats.complete.store(false, Ordering::Release);
+        *self.format.lock() = None;
+        self.push_notice(notice);
+    }
 }
 
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Identity of a file (device+inode on Unix, volume+file index on
+/// Windows), used to detect rotation: the path now refers to a different
+/// file than the one we have open.
+fn identity_of_path(path: &Path) -> Option<same_file::Handle> {
+    same_file::Handle::from_path(path).ok()
+}
+
+/// Map the whole file.  Returns `Data::Empty` for zero-length files (an
+/// empty mapping is an error on most platforms).
+fn map_file(file: &File, len: u64) -> std::io::Result<Data> {
+    if len == 0 {
+        return Ok(Data::Empty);
+    }
+    // SAFETY: the mapping is read-only.  hem never writes to the files it
+    // opens.  If another process truncates the file while it is mapped the
+    // OS may fault on access; this is documented in DECISIONS.md and is the
+    // standard trade-off every mmap-based viewer makes.
+    let map = unsafe { memmap2::MmapOptions::new().len(len as usize).map(file)? };
+    #[cfg(unix)]
+    {
+        let _ = map.advise(memmap2::Advice::Sequential);
+    }
+    Ok(Data::Mmap(map))
+}
+
+fn start_watcher(path: &Path, tx: Sender<()>) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = tx.send(());
+        }
+    })
+    .ok()?;
+    watcher
+        .watch(dir, notify::RecursiveMode::NonRecursive)
+        .ok()?;
+    Some(watcher)
+}
+
+/// The follower / indexer thread.
+fn follower_main(
+    inner: Arc<Inner>,
+    path: PathBuf,
+    opts: SourceOptions,
+    tx: Sender<()>,
+    rx: Receiver<()>,
+    eof_rx: Option<Receiver<()>>,
+) {
+    let _watcher = if opts.follow {
+        start_watcher(&path, tx.clone())
+    } else {
+        None
+    };
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            inner.push_notice(Notice::Error(format!("open {}: {e}", path.display())));
+            inner.stats.complete.store(true, Ordering::Release);
+            return;
+        }
+    };
+    let mut identity = identity_of_path(&path);
+    let mut mapped_len: u64 = 0;
+    let mut missing_reported = false;
+    let mut shrunk = false;
+    let mut last_progress = Instant::now();
+    let finite = eof_rx.is_some();
+    let mut writer_done = false;
+
+    loop {
+        if inner.stop.load(Ordering::Acquire) {
+            break;
+        }
+        if let Some(rx) = &eof_rx {
+            if !writer_done && rx.try_recv().is_ok() {
+                writer_done = true;
+            }
+        }
+
+        // Rotation / removal detection (real files only).
+        if inner.kind == SourceKind::File {
+            match identity_of_path(&path) {
+                Some(now) => {
+                    if identity.as_ref() != Some(&now) {
+                        if let Ok(nf) = File::open(&path) {
+                            file = nf;
+                            identity = Some(now);
+                            mapped_len = 0;
+                            inner.reset(Notice::Rotated);
+                            continue;
+                        }
+                    }
+                    missing_reported = false;
+                }
+                None => {
+                    if !missing_reported {
+                        inner.push_notice(Notice::Removed);
+                        missing_reported = true;
+                    }
+                }
+            }
+        }
+
+        let len = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => {
+                inner.push_notice(Notice::Error(format!("stat: {e}")));
+                inner.stats.complete.store(true, Ordering::Release);
+                break;
+            }
+        };
+        inner.stats.total_bytes.store(len, Ordering::Release);
+        let scanned = inner.state.read().index.scanned();
+
+        if len < scanned {
+            mapped_len = 0;
+            inner.reset(Notice::Truncated);
+            continue;
+        }
+
+        if len > scanned {
+            inner.stats.complete.store(false, Ordering::Release);
+            if len > mapped_len {
+                match map_file(&file, len) {
+                    Ok(data) => {
+                        let mut st = inner.state.write();
+                        st.data = Arc::new(data);
+                        mapped_len = len;
+                    }
+                    Err(e) => {
+                        inner.push_notice(Notice::Error(format!("mmap: {e}")));
+                        inner.stats.complete.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+            let data = inner.state.read().data.clone();
+            let mut from = scanned as usize;
+            let to = mapped_len as usize;
+            while from < to {
+                if inner.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let end = (from + SCAN_CHUNK).min(to);
+                let offsets = scan_offsets(&data[from..end], from as u64);
+                {
+                    let mut st = inner.state.write();
+                    st.index.append_offsets(&offsets, end as u64);
+                    inner
+                        .stats
+                        .line_count
+                        .store(st.index.line_count(), Ordering::Release);
+                }
+                inner
+                    .stats
+                    .indexed_bytes
+                    .store(end as u64, Ordering::Release);
+                from = end;
+                if last_progress.elapsed() > Duration::from_millis(30) {
+                    inner.wake();
+                    last_progress = Instant::now();
+                }
+            }
+            inner.wake();
+            continue;
+        }
+
+        if finite && !writer_done {
+            // Still being written (stdin / gunzip): not complete yet.
+            match rx.recv_timeout(opts.poll_interval) {
+                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            while rx.try_recv().is_ok() {}
+            continue;
+        }
+        if !shrunk {
+            inner.state.write().index.shrink_to_fit();
+            shrunk = true;
+        }
+        inner.stats.complete.store(true, Ordering::Release);
+        inner.wake();
+
+        if finite && writer_done {
+            inner.stats.eof.store(true, Ordering::Release);
+            break;
+        }
+        if !opts.follow && !finite {
+            break;
+        }
+
+        match rx.recv_timeout(opts.poll_interval) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Coalesce bursts of events.
+        while rx.try_recv().is_ok() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn memory_source_lines() {
+        let src = Source::from_bytes("mem", b"one\ntwo\r\nthree".to_vec());
+        let g = src.read();
+        assert_eq!(g.line_count(), 3);
+        assert_eq!(g.line(0), Some(&b"one"[..]));
+        assert_eq!(g.line(1), Some(&b"two"[..]));
+        assert_eq!(g.line(2), Some(&b"three"[..]));
+        assert_eq!(g.line(3), None);
+    }
+
+}

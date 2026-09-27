@@ -367,3 +367,70 @@ pub fn syslog_fields(line: &[u8]) -> Vec<Field> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_flatten_and_get() {
+        let l = br#"{"level":"info","ts":1.5,"ctx":{"user":"bob","n":[1,2]},"msg":"a \"q\""}"#;
+        let f = json_fields(l);
+        assert!(f.contains(&("ctx.user".into(), "bob".into())));
+        assert!(f.contains(&("ctx.n".into(), "[1,2]".into())));
+        assert_eq!(json_get(l, "level").as_deref(), Some("info"));
+        assert_eq!(json_get(l, "ts").as_deref(), Some("1.5"));
+        assert_eq!(json_get(l, "msg").as_deref(), Some("a \"q\""));
+        assert_eq!(json_get(l, "nope"), None);
+        assert_eq!(json_get(b"not json", "x"), None);
+        assert_eq!(json_get(br#"{"a":"#, "a"), None);
+    }
+
+    #[test]
+    fn logfmt_pairs() {
+        let l = br#"ts=2026-10-13T10:00:00Z level=warn msg="slow query (812ms)" dur=812 flag"#;
+        let f = logfmt_fields(l);
+        assert_eq!(f.len(), 4);
+        assert_eq!(f[2], ("msg".into(), "slow query (812ms)".into()));
+        assert_eq!(logfmt_get(l, "level"), Some(&b"warn"[..]));
+        assert_eq!(logfmt_get(l, "msg"), Some(&b"slow query (812ms)"[..]));
+        assert_eq!(logfmt_get(l, "s"), None);
+    }
+
+    #[test]
+    fn nginx_combined() {
+        let l = br#"1.2.3.4 - bob [13/Oct/2026:13:55:36 -0500] "GET /x?y=1 HTTP/1.1" 503 12 "-" "curl/8""#;
+        let f = nginx_fields(l);
+        let get = |k: &str| f.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("status"), Some("503"));
+        assert_eq!(get("path"), Some("/x?y=1"));
+        assert_eq!(get("user_agent"), Some("curl/8"));
+        assert_eq!(get("user"), Some("bob"));
+    }
+
+    #[test]
+    fn syslog_parts() {
+        let f = syslog_fields(b"Oct 13 10:02:11 web01 sshd[1234]: Accepted publickey for bob");
+        let get = |k: &str| f.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("host"), Some("web01"));
+        assert_eq!(get("app"), Some("sshd"));
+        assert_eq!(get("pid"), Some("1234"));
+        assert_eq!(get("msg"), Some("Accepted publickey for bob"));
+    }
+
+    #[test]
+    fn garbage_is_safe() {
+        let junk: Vec<u8> = (0..=255u8).collect();
+        for fmt in [
+            Format::Json,
+            Format::Logfmt,
+            Format::Nginx,
+            Format::Syslog,
+            Format::Plain,
+        ] {
+            let _ = extract(&junk, fmt);
+            let _ = get(&junk, fmt, "x");
+            let _ = extract(b"", fmt);
+        }
+    }
+}

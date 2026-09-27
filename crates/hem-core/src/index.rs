@@ -105,14 +105,40 @@ impl LineIndex {
         self.scanned = to as u64;
     }
 
+    /// Append a batch of precomputed offsets (used by parallel scanners).
+    pub fn append_offsets(&mut self, offsets: &[u64], scanned_to: u64) {
+        if self.offsets.is_empty() && scanned_to > 0 {
+            self.offsets.push(0);
+        }
+        self.offsets.extend_from_slice(offsets);
+        self.scanned = scanned_to;
+    }
+
     pub fn offsets(&self) -> &[u64] {
         &self.offsets
+    }
+
+    /// Release spare capacity (called once the initial scan completes).
+    pub fn shrink_to_fit(&mut self) {
+        if self.offsets.capacity() > self.offsets.len() + self.offsets.len() / 16 {
+            self.offsets.shrink_to_fit();
+        }
     }
 
     /// Approximate heap memory used by the index, in bytes.
     pub fn memory_bytes(&self) -> usize {
         self.offsets.capacity() * std::mem::size_of::<u64>()
     }
+}
+
+/// Scan a slice for line starts without touching an index.  Returns the
+/// absolute offsets (`base + position + 1`) of every newline in `data`.
+pub fn scan_offsets(data: &[u8], base: u64) -> Vec<u64> {
+    let mut v = Vec::with_capacity(data.len() / 64 + 1);
+    for p in memchr_iter(b'\n', data) {
+        v.push(base + p as u64 + 1);
+    }
+    v
 }
 
 #[cfg(test)]
@@ -128,6 +154,14 @@ mod tests {
                 String::from_utf8_lossy(&data[s as usize..e as usize]).into_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn empty_file() {
+        let mut idx = LineIndex::new();
+        idx.extend_from(b"");
+        assert_eq!(idx.line_count(), 0);
+        assert!(idx.span(0, b"").is_none());
     }
 
     #[test]

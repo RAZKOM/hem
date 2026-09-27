@@ -204,6 +204,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_formats() {
+        let json: Vec<&[u8]> = vec![br#"{"a":1}"#, br#"{"b":2}"#, b"garbage"];
+        assert_eq!(Format::detect(&json), Format::Json);
+        let logfmt: Vec<&[u8]> = vec![
+            b"ts=1 level=info msg=\"hi there\"",
+            b"ts=2 level=warn msg=x",
+        ];
+        assert_eq!(Format::detect(&logfmt), Format::Logfmt);
+        let nginx: Vec<&[u8]> =
+            vec![br#"1.2.3.4 - - [13/Oct/2026:13:55:36 -0500] "GET / HTTP/1.1" 200 12 "-" "curl""#];
+        assert_eq!(Format::detect(&nginx), Format::Nginx);
+        let syslog: Vec<&[u8]> = vec![
+            b"Oct 13 10:02:11 host app[1]: hi",
+            b"<34>Oct 11 22:14:15 x y: z",
+        ];
+        assert_eq!(Format::detect(&syslog), Format::Syslog);
+        let plain: Vec<&[u8]> = vec![b"2026-10-13 10:02:11 INFO hello", b"x=1"];
+        assert_eq!(Format::detect(&plain), Format::Plain);
+        assert_eq!(Format::detect(&[]), Format::Plain);
+    }
+
+    #[test]
     fn parses_names() {
         assert_eq!("JSON".parse::<Format>().ok(), Some(Format::Json));
         assert!("xml".parse::<Format>().is_err());

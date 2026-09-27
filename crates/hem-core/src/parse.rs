@@ -272,6 +272,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stack_trace_line_has_nothing() {
+        let m = parse_line(
+            b"    at com.example.Foo.bar(Foo.java:42)",
+            Format::Plain,
+            2026,
+        );
+        assert_eq!(m, LineMeta::default());
+    }
+
+    #[test]
     fn cache_roundtrip() {
         let c = MetaCache::new(2);
         let m = c.get_or_parse(0, 1, b"INFO x", Format::Plain, 2026);

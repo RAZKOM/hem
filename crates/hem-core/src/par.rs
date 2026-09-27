@@ -87,3 +87,52 @@ where
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emits_in_order() {
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        ordered_scan(
+            100,
+            4,
+            &cancel,
+            |i| {
+                // Deliberately uneven work.
+                std::thread::sleep(std::time::Duration::from_micros(
+                    ((i * 37) % 11) as u64 * 50,
+                ));
+                i * 2
+            },
+            |i, r| {
+                seen.push((i, r));
+                true
+            },
+        );
+        assert_eq!(seen.len(), 100);
+        for (k, (i, r)) in seen.iter().enumerate() {
+            assert_eq!(*i, k);
+            assert_eq!(*r, k * 2);
+        }
+    }
+
+    #[test]
+    fn stops_when_asked() {
+        let cancel = AtomicBool::new(false);
+        let mut n = 0;
+        ordered_scan(
+            1000,
+            3,
+            &cancel,
+            |i| i,
+            |_, _| {
+                n += 1;
+                n < 10
+            },
+        );
+        assert_eq!(n, 10);
+    }
+}

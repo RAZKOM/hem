@@ -63,6 +63,10 @@ impl Search {
         s
     }
 
+    pub fn matcher(&self) -> &Matcher {
+        &self.0.matcher
+    }
+
     pub fn pattern(&self) -> &str {
         &self.0.matcher.text
     }

@@ -342,3 +342,34 @@ impl Filter {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predicates() {
+        let p = FieldPredicate::parse("status>=500").unwrap();
+        assert!(p.matches(br#"{"status":503}"#, Format::Json));
+        assert!(!p.matches(br#"{"status":200}"#, Format::Json));
+        assert!(!p.matches(br#"{"x":1}"#, Format::Json));
+        let p = FieldPredicate::parse("user=bob").unwrap();
+        assert!(p.matches(b"ts=1 user=bob", Format::Logfmt));
+        assert!(p.matches(b"ts=1 user=Bob", Format::Logfmt));
+        assert!(!p.matches(b"ts=1 user=alice", Format::Logfmt));
+        let p = FieldPredicate::parse("msg~time.?out").unwrap();
+        assert!(p.matches(br#"{"msg":"Timeout!"}"#, Format::Json));
+        let p = FieldPredicate::parse("trace_id?").unwrap();
+        assert!(p.matches(br#"{"trace_id":"x"}"#, Format::Json));
+        assert!(!p.matches(br#"{"y":"x"}"#, Format::Json));
+        let p = FieldPredicate::parse("user!=bob").unwrap();
+        assert!(p.matches(br#"{"user":"al"}"#, Format::Json));
+        assert!(
+            p.matches(br#"{"x":1}"#, Format::Json),
+            "missing field != value"
+        );
+        assert!(FieldPredicate::parse("nonsense").is_err());
+        assert!(FieldPredicate::parse("=x").is_err());
+    }
+
+}

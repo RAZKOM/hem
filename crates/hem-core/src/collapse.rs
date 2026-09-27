@@ -115,6 +115,11 @@ pub fn shape_hash(line: &[u8]) -> u64 {
     h
 }
 
+/// True if two lines collapse together.
+pub fn same_shape(a: &[u8], b: &[u8]) -> bool {
+    a == b || shape_hash(a) == shape_hash(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +158,14 @@ mod tests {
             "ERROR connection reset by peer"
         );
         assert_eq!(n("abc123def"), "#");
+    }
+
+    #[test]
+    fn hashes_agree() {
+        let a = b"connection reset by peer (attempt 4)";
+        let b = b"connection reset by peer (attempt 17)";
+        assert!(same_shape(a, b));
+        assert!(!same_shape(a, b"connection closed by peer (attempt 4)"));
+        assert_eq!(shape_hash(a), shape_hash(&normalize(a)));
     }
 }
