@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
@@ -51,6 +52,28 @@ pub enum SourceKind {
     Stdin,
     Gzip,
     Memory,
+}
+
+/// Options controlling how a source is opened and followed.
+#[derive(Debug, Clone)]
+pub struct SourceOptions {
+    /// Keep watching the file for growth / rotation after the initial index.
+    pub follow: bool,
+    /// Polling interval used as a fallback when filesystem events are
+    /// unreliable (and as the heartbeat for stdin / gzip temp files).
+    pub poll_interval: Duration,
+    /// Force a line format instead of auto-detecting.
+    pub format: Option<Format>,
+}
+
+impl Default for SourceOptions {
+    fn default() -> Self {
+        Self {
+            follow: true,
+            poll_interval: Duration::from_millis(250),
+            format: None,
+        }
+    }
 }
 
 /// Transient notices produced by the follower (shown in the status bar).
@@ -186,6 +209,30 @@ impl SourceGuard<'_> {
 }
 
 impl Source {
+    /// An in-memory source, indexed synchronously.  Handy for tests and for
+    /// small pasted inputs.
+    pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        let opts = SourceOptions::default();
+        let inner = Inner::new(name.into(), None, SourceKind::Memory, &opts);
+        {
+            let mut st = inner.state.write();
+            let mut index = LineIndex::new();
+            index.extend_from(&bytes);
+            let len = bytes.len() as u64;
+            st.data = Arc::new(Data::Vec(bytes));
+            st.index = index;
+            inner.stats.indexed_bytes.store(len, Ordering::Release);
+            inner.stats.total_bytes.store(len, Ordering::Release);
+            inner
+                .stats
+                .line_count
+                .store(st.index.line_count(), Ordering::Release);
+            inner.stats.complete.store(true, Ordering::Release);
+            inner.stats.eof.store(true, Ordering::Release);
+        }
+        Source(Arc::new(inner))
+    }
+
     /// Append bytes to an in-memory source (tests / pasted input).
     pub fn append_bytes(&self, bytes: &[u8]) {
         let mut st = self.0.state.write();
@@ -312,6 +359,28 @@ impl Drop for Inner {
 }
 
 impl Inner {
+    fn new(name: String, path: Option<PathBuf>, kind: SourceKind, opts: &SourceOptions) -> Self {
+        Self {
+            name,
+            path,
+            kind,
+            state: RwLock::new(State {
+                data: Arc::new(Data::Empty),
+                index: LineIndex::new(),
+                generation: 0,
+            }),
+            stats: Stats::default(),
+            notices: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+            wakers: Mutex::new(Vec::new()),
+            poke: Mutex::new(None),
+            format_override: opts.format,
+            format: Mutex::new(None),
+            follow: opts.follow,
+            _temp: Mutex::new(None),
+        }
+    }
+
     fn wake(&self) {
         for w in self.wakers.lock().iter() {
             w();

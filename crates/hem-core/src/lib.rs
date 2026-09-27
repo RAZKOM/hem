@@ -26,4 +26,4 @@ pub mod view;
 
 pub use error::{Error, Result};
 pub use level::Level;
-pub use source::{Source, SourceGuard};
+pub use source::{Source, SourceGuard, SourceOptions};

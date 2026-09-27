@@ -170,6 +170,14 @@ impl FieldPredicate {
             }
         }
     }
+
+    pub fn display(&self) -> String {
+        if self.op == Op::Exists {
+            format!("{}?", self.key)
+        } else {
+            format!("{}{}{}", self.key, self.op.as_str(), self.value)
+        }
+    }
 }
 
 fn cmp_eq(v: &str, want: &str, want_num: Option<f64>) -> bool {
@@ -197,6 +205,18 @@ pub struct TemplateMatch {
 }
 
 impl TemplateMatch {
+    pub fn display(&self) -> String {
+        let parts: Vec<&str> = self
+            .tokens
+            .iter()
+            .map(|t| match t {
+                Token::Lit(s) => s.as_str(),
+                Token::Wild => "<*>",
+            })
+            .collect();
+        parts.join(" ")
+    }
+
     pub fn matches(&self, line: &[u8]) -> bool {
         let toks = crate::cluster::tokenize(line, self.format);
         if toks.len() != self.tokens.len() {

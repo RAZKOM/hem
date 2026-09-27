@@ -15,7 +15,7 @@ use std::borrow::Cow;
 
 use crate::collapse::normalize;
 use crate::fields;
-use crate::filter::Token;
+use crate::filter::{TemplateMatch, Token};
 use crate::format::Format;
 use crate::level::Level;
 use crate::parse::parse_line;
@@ -91,6 +91,17 @@ pub struct Template {
 }
 
 impl Template {
+    pub fn display(&self) -> String {
+        self.matcher().display()
+    }
+
+    pub fn matcher(&self) -> TemplateMatch {
+        TemplateMatch {
+            tokens: self.tokens.clone(),
+            format: self.format,
+        }
+    }
+
     /// Most common level.
     pub fn dominant_level(&self) -> Option<Level> {
         let (mut best, mut best_n) = (None, 0u64);
@@ -101,6 +112,14 @@ impl Template {
             }
         }
         best
+    }
+
+    /// Highest level seen at least once.
+    pub fn max_level(&self) -> Option<Level> {
+        (0..Level::COUNT)
+            .rev()
+            .find(|&i| self.levels[i] > 0)
+            .and_then(Level::from_index)
     }
 }
 
@@ -357,4 +376,38 @@ mod tests {
         assert_eq!(t, vec!["WARN", "slow", "query", "took", "<*>"]);
     }
 
+    #[test]
+    fn mines_templates() {
+        let mut m = Miner::new();
+        let r = Row::new(0, 0, 1);
+        for (i, name) in ["bob", "alice", "carol", "dave"].iter().enumerate() {
+            let line = format!("2026-10-13 10:00:0{i} INFO login ok: user {name} from 10.0.0.{i}");
+            m.add(
+                &tokenize(line.as_bytes(), Format::Plain),
+                Format::Plain,
+                Row::new(i as u64, 0, 1),
+                Some(Level::Info),
+                None,
+            );
+        }
+        m.add(
+            &tokenize(b"Disk full on /dev/sda1", Format::Plain),
+            Format::Plain,
+            r,
+            Some(Level::Error),
+            None,
+        );
+        assert_eq!(m.len(), 2);
+        let t = &m.templates()[0];
+        assert_eq!(t.display(), "<*> <*> INFO login ok: user <*> from <*>");
+        assert_eq!(t.count, 4);
+        assert_eq!(t.levels[Level::Info.index()], 4);
+        assert!(t
+            .matcher()
+            .matches(b"2026-10-13 10:00:09 INFO login ok: user zed from 1.2.3.4"));
+        assert!(!t
+            .matcher()
+            .matches(b"2026-10-13 10:00:09 INFO login failed: user zed from 1.2.3.4"));
+        assert_eq!(m.templates()[1].max_level(), Some(Level::Error));
+    }
 }
