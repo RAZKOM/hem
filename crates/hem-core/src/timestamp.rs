@@ -27,6 +27,12 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Epoch milliseconds for a civil date-time in UTC.
+pub fn civil_to_ms(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32, ms: u32) -> i64 {
+    let days = days_from_civil(y, mo, d);
+    ((days * 86_400 + h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000) + ms as i64
+}
+
 fn valid_date(y: i64, m: u32, d: u32) -> bool {
     (1970..=2200).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)
 }
@@ -333,6 +339,75 @@ pub fn find(line: &[u8], default_year: i64) -> Option<Ts> {
     None
 }
 
+/// Parse a complete string (user input such as `--since`) into epoch ms.
+/// Accepts every log format plus relative forms like `5m`, `2h`, `1d`
+/// (meaning "that long ago"), `today`, and `now`.
+pub fn parse_user(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let now = Utc::now();
+    if s.eq_ignore_ascii_case("now") {
+        return Some(now.timestamp_millis());
+    }
+    if s.eq_ignore_ascii_case("today") {
+        let d = Local::now().date_naive();
+        return Some(civil_to_ms(d.year() as i64, d.month(), d.day(), 0, 0, 0, 0));
+    }
+    if let Some(ms) = parse_relative(s) {
+        return Some(now.timestamp_millis() - ms);
+    }
+    let b = s.as_bytes();
+    if let Some(ts) = parse_at(b, 0, now.year() as i64) {
+        if ts.end == b.len() {
+            return Some(ts.ms);
+        }
+    }
+    // Time of day only: today at that time.
+    if let Some((tod, end)) = parse_time(b, 0) {
+        if end == b.len() {
+            let d = Local::now().date_naive();
+            return Some(civil_to_ms(d.year() as i64, d.month(), d.day(), 0, 0, 0, 0) + tod);
+        }
+    }
+    None
+}
+
+fn parse_relative(s: &str) -> Option<i64> {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let idx = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (n, unit) = s.split_at(idx);
+    let n: f64 = n.parse().ok()?;
+    let mult = match unit.trim() {
+        "ms" => 1.0,
+        "s" | "sec" | "secs" | "second" | "seconds" => 1000.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000.0,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000.0,
+        "d" | "day" | "days" => 86_400_000.0,
+        "w" | "week" | "weeks" => 7.0 * 86_400_000.0,
+        _ => return None,
+    };
+    Some((n * mult) as i64)
+}
+
+/// Display styles for timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TsDisplay {
+    /// Show the original text from the line.
+    #[default]
+    Original,
+    /// `HH:MM:SS.mmm`
+    Time,
+    /// `YYYY-MM-DD HH:MM:SS.mmm` in UTC.
+    Iso,
+    /// `YYYY-MM-DD HH:MM:SS.mmm` in local time.
+    Local,
+    /// Seconds relative to the first timestamp in the file.
+    Relative,
+}
+
 /// Human-friendly short form for axis labels: picks a precision suited to
 /// the span being labelled.
 pub fn format_axis(ms: i64, span_ms: i64) -> String {
@@ -367,6 +442,58 @@ mod tests {
     }
 
     #[test]
+    fn civil_days() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11017);
+        assert_eq!(civil_to_ms(2026, 10, 13, 10, 2, 11, 204), 1_791_885_731_204);
+    }
+
+    #[test]
+    fn iso_variants() {
+        let base = civil_to_ms(2026, 10, 13, 10, 2, 11, 204);
+        assert_eq!(ms("2026-10-13T10:02:11.204Z info"), Some(base));
+        assert_eq!(ms("2026-10-13 10:02:11.204 info"), Some(base));
+        assert_eq!(ms("2026-10-13 10:02:11,204 info"), Some(base));
+        assert_eq!(ms("2026/10/13 10:02:11.204 info"), Some(base));
+        assert_eq!(
+            ms("2026-10-13T12:02:11.204+02:00"),
+            Some(base),
+            "zone offset applied"
+        );
+        assert_eq!(ms("2026-10-13T05:02:11.204-0500"), Some(base));
+        assert_eq!(
+            ms("2026-10-13T10:02:11.204567Z"),
+            Some(base),
+            "micros truncated"
+        );
+        assert_eq!(
+            ms("2026-10-13"),
+            Some(civil_to_ms(2026, 10, 13, 0, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn clf_and_syslog() {
+        let base = civil_to_ms(2026, 10, 13, 18, 55, 36, 0);
+        assert_eq!(
+            ms(r#"1.2.3.4 - - [13/Oct/2026:13:55:36 -0500] "GET / HTTP/1.1" 200"#),
+            Some(base)
+        );
+        assert_eq!(
+            ms("Oct 13 10:02:11 host app[1]: hi"),
+            Some(civil_to_ms(2026, 10, 13, 10, 2, 11, 0))
+        );
+        assert_eq!(
+            ms("Oct  3 10:02:11 host app[1]: hi"),
+            Some(civil_to_ms(2026, 10, 3, 10, 2, 11, 0))
+        );
+        assert_eq!(
+            ms("Oct 13, 2025 10:02:11 x"),
+            Some(civil_to_ms(2025, 10, 13, 10, 2, 11, 0))
+        );
+    }
+
+    #[test]
     fn epoch_variants() {
         assert_eq!(ms("1791885731 x"), Some(1_791_885_731_000));
         assert_eq!(ms("1791885731.204 x"), Some(1_791_885_731_204));
@@ -387,5 +514,18 @@ mod tests {
     fn find_span() {
         let t = find(b"[2026-10-13T10:02:11Z] x", 2026).unwrap();
         assert_eq!((t.start, t.end), (1, 21));
+    }
+
+    #[test]
+    fn user_input() {
+        assert!(parse_user("5m").is_some());
+        assert!(
+            parse_user("2026-10-13 10:00").is_none() || parse_user("2026-10-13 10:00:00").is_some()
+        );
+        assert_eq!(
+            parse_user("2026-10-13T10:00:00Z"),
+            Some(civil_to_ms(2026, 10, 13, 10, 0, 0, 0))
+        );
+        assert_eq!(parse_user("garbage"), None);
     }
 }

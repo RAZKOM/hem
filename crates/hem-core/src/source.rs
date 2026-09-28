@@ -346,6 +346,10 @@ impl Source {
         self.0.path.as_deref()
     }
 
+    pub fn kind(&self) -> SourceKind {
+        self.0.kind
+    }
+
     /// Acquire a read guard over the current data and index.
     pub fn read(&self) -> SourceGuard<'_> {
         SourceGuard {

@@ -87,3 +87,37 @@ needed. Items marked **review** deserve a look from the owner.
   sampling cap as the TUI.
 - A broken pipe (`| head`) exits 0 silently.
 
+## Platform notes
+
+- **Windows cannot truncate a memory-mapped file.** While hem has a file
+  open, a writer that truncates it in place (`copytruncate` rotation) gets
+  "The requested operation cannot be performed on a file with a user-mapped
+  section open". Rename-based rotation works, and hem detects it via file
+  identity (`same-file`: volume + file index on Windows, dev + inode on
+  Unix). The in-place truncation test is Unix-only for this reason.
+  **review**: a `--no-mmap` mode (pread into a chunk cache) would remove
+  this limitation at some cost in simplicity.
+- On Unix, truncation of a mapped file can make the mapping fault
+  (SIGBUS) if a reader touches pages past the new end between the writer's
+  truncate and hem's next poll (≤ 250 ms). This is the standard mmap
+  trade-off and the same one `less` makes.
+- Deleting a file while hem has it open: Unix keeps showing the old inode;
+  Windows refuses the delete while mapped. Both are reported as a notice.
+
+## Dependencies worth justifying
+
+- `ratatui` + `crossterm`: as specified. `ratatui` 0.30 pulls in several
+  sub-crates (`ratatui-core`, `ratatui-widgets`, …) but no extra system deps.
+- `arboard` (default features off): system clipboard. On Linux it links
+  X11/Wayland client libraries at runtime only; nothing extra is needed to
+  build. OSC 52 is the fallback everywhere.
+- `aho-corasick`: level keyword scanning (already a transitive dependency of
+  `regex`).
+- `same-file`: file identity for rotation detection; tiny.
+- `flate2` (miniz_oxide backend): `.gz` support, pure Rust.
+- `notify` 8 with default features off except `macos_fsevent`: filesystem
+  events, with a 250 ms polling heartbeat as the fallback.
+- `chrono` (std + clock features only): user-facing time formatting and
+  input parsing; the hot-path timestamp parser is hand written.
+- `criterion` with default features off: benchmarks only.
+
