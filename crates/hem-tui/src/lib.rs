@@ -6,6 +6,7 @@
 //! functions also work against ratatui's `TestBackend` for tests.
 
 pub mod app;
+pub mod config;
 pub mod keymap;
 pub mod modal;
 

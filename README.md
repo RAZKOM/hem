@@ -41,3 +41,23 @@ found in ISO 8601 / RFC 3339, `YYYY-MM-DD HH:MM:SS[,fff]`, `YYYY/MM/DD`,
 syslog, Apache/nginx bracket form and epoch seconds/millis/micros/nanos
 (including JSON `time`/`ts`/`timestamp`/`@timestamp` fields).
 
+## Plain mode
+
+When stdout is not a terminal, or with `--plain`, hem prints lines instead
+of starting the TUI. Colour is used when stdout is a terminal (respecting
+`NO_COLOR`), or with `--color`.
+
+```sh
+hem app.log --level error --plain | wc -l          # count errors (with their stack traces)
+hem app.log --filter 'user=bob' -x health --plain   # include + exclude
+hem api.jsonl --field 'status>=500' --field 'path~^/api' --plain
+hem a.log b.log --merge --plain                     # interleaved, with a source column
+hem app.log --collapse --plain                      # repeated runs become "×N line"
+hem app.log -f --plain                              # like tail -F, with filters
+hem templates app.log -n 20 --rare                  # the 20 rarest templates
+hem templates app.log --json | jq .
+```
+
+Exit codes: `0` ok, `1` runtime error (unreadable file, bad regex, bad
+config), `2` usage error.
+

@@ -14,5 +14,6 @@ anyhow.workspace = true
 serde.workspace = true
 parking_lot.workspace = true
 crossterm = "0.29"
+directories = "6"
 
 [dev-dependencies]
