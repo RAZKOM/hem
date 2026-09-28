@@ -513,6 +513,7 @@ pub fn wait_complete(c: &Clusters, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::Source;
 
     #[test]
     fn tokenizes_with_wildcards() {
@@ -564,5 +565,27 @@ mod tests {
             .matcher()
             .matches(b"2026-10-13 10:00:09 INFO login failed: user zed from 1.2.3.4"));
         assert_eq!(m.templates()[1].max_level(), Some(Level::Error));
+    }
+
+    #[test]
+    fn background_job_and_sampling() {
+        let mut text = String::new();
+        for i in 0..20_000 {
+            text.push_str(&format!("INFO request {i} served in {}ms\n", i % 7));
+        }
+        for _ in 0..5 {
+            text.push_str("ERROR disk full\n");
+        }
+        let src = Source::from_bytes("t", text.into_bytes());
+        src.stop();
+        let c = Clusters::start(Base::Single(src), 5000);
+        assert!(wait_complete(&c, Duration::from_secs(10)));
+        assert!(c.is_sampled());
+        assert_eq!(c.stride(), 5);
+        let t = c.templates();
+        assert!(!t.is_empty());
+        let top = t.iter().max_by_key(|t| t.count).unwrap();
+        assert_eq!(top.display(), "INFO request <*> served in <*>");
+        assert!(top.count >= 3900 && top.count <= 4001, "{}", top.count);
     }
 }
