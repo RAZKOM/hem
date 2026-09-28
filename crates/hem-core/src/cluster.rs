@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -19,7 +21,7 @@ use crate::filter::{TemplateMatch, Token};
 use crate::format::Format;
 use crate::level::Level;
 use crate::parse::parse_line;
-use crate::view::{Base, Row};
+use crate::view::{Base, Row, CHUNK_ROWS};
 
 const MAX_TOKENS: usize = 48;
 const MAX_TOKEN_LEN: usize = 48;
@@ -137,6 +139,12 @@ pub struct Miner {
     pub max_templates: usize,
     roots: HashMap<usize, Node>,
     templates: Vec<Template>,
+}
+
+impl std::fmt::Debug for Miner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Miner({} templates)", self.templates.len())
+    }
 }
 
 impl Default for Miner {
@@ -335,9 +343,39 @@ impl Drop for Inner {
 }
 
 impl Clusters {
+    /// Start mining.  At most `cap` lines are processed; larger inputs are
+    /// sampled with a fixed stride (reported by [`Clusters::stride`]).
+    pub fn start(base: Base, cap: usize) -> Clusters {
+        let inner = Arc::new(Inner {
+            base,
+            snapshot: RwLock::new(Arc::new(Vec::new())),
+            processed: AtomicU64::new(0),
+            stride: AtomicU64::new(1),
+            complete: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            wakers: Mutex::new(Vec::new()),
+            cap: cap.max(1000),
+        });
+        let c = Clusters(inner);
+        let c2 = c.clone();
+        let _ = std::thread::Builder::new()
+            .name("hem-cluster".into())
+            .spawn(move || cluster_main(c2));
+        c
+    }
+
     /// Current templates (a cheap snapshot).
     pub fn templates(&self) -> Arc<Vec<Template>> {
         Arc::clone(&self.0.snapshot.read())
+    }
+
+    /// Sampling stride (1 = every line).
+    pub fn stride(&self) -> u64 {
+        self.0.stride.load(Ordering::Acquire)
+    }
+
+    pub fn is_sampled(&self) -> bool {
+        self.stride() > 1
     }
 
     pub fn is_complete(&self) -> bool {
@@ -353,6 +391,123 @@ impl Clusters {
             w();
         }
     }
+}
+
+fn cluster_main(c: Clusters) {
+    let inner = &c.0;
+    let (tx, rx) = mpsc::channel::<()>();
+    {
+        let tx = tx.clone();
+        inner.base.add_waker(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+    }
+    let default_year = crate::timestamp::current_year();
+    let mut miner = Miner::new();
+    let mut gen = inner.base.generation();
+    let mut next: usize = 0;
+    let mut stride: usize = 1;
+    let mut last_publish = Instant::now();
+    let mut dirty = false;
+
+    loop {
+        if inner.cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let g = inner.base.generation();
+        if g != gen {
+            gen = g;
+            next = 0;
+            miner = Miner::new();
+            *inner.snapshot.write() = Arc::new(Vec::new());
+            inner.processed.store(0, Ordering::Release);
+        }
+        let avail = inner.base.len();
+        // Decide the stride from the first sizeable estimate of the total.
+        if stride == 1 {
+            let total_est = match &inner.base {
+                Base::Single(s) => {
+                    let indexed = s.indexed_bytes().max(1);
+                    let lines = s.line_count() as u64;
+                    if s.is_complete() {
+                        lines
+                    } else {
+                        lines.saturating_mul(s.total_bytes()) / indexed
+                    }
+                }
+                Base::Merged(_) => avail as u64,
+            } as usize;
+            if total_est > inner.cap {
+                stride = total_est.div_ceil(inner.cap);
+                inner.stride.store(stride as u64, Ordering::Release);
+            }
+        }
+        if avail > next {
+            inner.complete.store(false, Ordering::Release);
+            let b = (next + CHUNK_ROWS * stride).min(avail);
+            let chunk = inner.base.chunk(next, b);
+            let formats = inner.base.formats();
+            let mut i = 0;
+            while i < chunk.len() {
+                let line = chunk.line(i);
+                let row = chunk.row(i);
+                let fmt = formats
+                    .get(row.source() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                let meta = parse_line(line, fmt, default_year);
+                let toks = tokenize(line, fmt);
+                if !toks.is_empty() {
+                    miner.add(&toks, fmt, row, meta.level, meta.ts);
+                }
+                i += stride;
+            }
+            next = b;
+            inner
+                .processed
+                .fetch_add((chunk.len() / stride.max(1)) as u64, Ordering::Release);
+            dirty = true;
+            if last_publish.elapsed() > Duration::from_millis(150) {
+                *inner.snapshot.write() = Arc::new(miner.templates().to_vec());
+                last_publish = Instant::now();
+                dirty = false;
+                c.wake();
+            }
+            continue;
+        }
+        if dirty {
+            *inner.snapshot.write() = Arc::new(miner.templates().to_vec());
+            dirty = false;
+            c.wake();
+        }
+        if inner.base.is_complete() {
+            inner.complete.store(true, Ordering::Release);
+            c.wake();
+            if !inner.base.is_live() {
+                break;
+            }
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        while rx.try_recv().is_ok() {}
+    }
+    *inner.snapshot.write() = Arc::new(miner.templates().to_vec());
+    inner.complete.store(true, Ordering::Release);
+    c.wake();
+}
+
+/// Block until clustering is complete (tests / CLI).
+pub fn wait_complete(c: &Clusters, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while !c.is_complete() {
+        if start.elapsed() > timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
 }
 
 #[cfg(test)]

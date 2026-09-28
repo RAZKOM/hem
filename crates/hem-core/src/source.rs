@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,85 @@ impl SourceGuard<'_> {
 }
 
 impl Source {
+    /// Open a file (or a `.gz` file, which is transparently decompressed
+    /// into a temp file in the background).
+    pub fn open(path: impl AsRef<Path>, opts: SourceOptions) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let meta = std::fs::metadata(&path).map_err(|e| Error::Open {
+            path: path.clone(),
+            source: e,
+        })?;
+        if meta.is_dir() {
+            return Err(Error::IsDirectory { path });
+        }
+        let is_gz = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gz"))
+            .unwrap_or(false);
+        if is_gz {
+            return Self::open_gzip(path, opts);
+        }
+        let name = display_name(&path);
+        let inner = Arc::new(Inner::new(
+            name,
+            Some(path.clone()),
+            SourceKind::File,
+            &opts,
+        ));
+        let src = Source(inner);
+        src.spawn_follower(path, opts, None);
+        Ok(src)
+    }
+
+    fn open_gzip(path: PathBuf, opts: SourceOptions) -> Result<Self> {
+        let file = File::open(&path).map_err(|e| Error::Open {
+            path: path.clone(),
+            source: e,
+        })?;
+        let temp = tempfile::Builder::new()
+            .prefix("hem-gz-")
+            .tempfile()
+            .map_err(Error::Io)?;
+        let temp_path = temp.path().to_path_buf();
+        let name = display_name(&path);
+        let inner = Arc::new(Inner::new(name, Some(path), SourceKind::Gzip, &opts));
+        *inner._temp.lock() = Some(temp);
+        let src = Source(inner);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let writer_path = temp_path.clone();
+        let src2 = src.clone();
+        std::thread::Builder::new()
+            .name("hem-gunzip".into())
+            .spawn(move || {
+                let res = (|| -> std::io::Result<()> {
+                    let mut out = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&writer_path)?;
+                    let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file));
+                    let mut buf = vec![0u8; 1 << 20];
+                    loop {
+                        if src2.0.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let n = dec.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        out.write_all(&buf[..n])?;
+                    }
+                    out.flush()
+                })();
+                if let Err(e) = res {
+                    src2.0.push_notice(Notice::Error(format!("gunzip: {e}")));
+                }
+                src2.0.poke();
+                let _ = done_tx.send(());
+            })
+            .map_err(Error::Io)?;
+        src.spawn_follower(temp_path, opts, Some(done_rx));
+        Ok(src)
+    }
+
     /// An in-memory source, indexed synchronously.  Handy for tests and for
     /// small pasted inputs.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
@@ -303,6 +382,11 @@ impl Source {
         self.0.stats.generation.load(Ordering::Acquire)
     }
 
+    /// Drain pending notices.
+    pub fn take_notices(&self) -> Vec<Notice> {
+        std::mem::take(&mut *self.0.notices.lock())
+    }
+
     /// Install a callback invoked whenever new data becomes available.
     pub fn add_waker(&self, waker: Waker) {
         self.0.wakers.lock().push(waker);
@@ -357,6 +441,15 @@ impl Source {
     /// Override the format at runtime.
     pub fn set_format(&self, format: Option<Format>) {
         *self.0.format.lock() = format;
+    }
+
+    fn spawn_follower(&self, path: PathBuf, opts: SourceOptions, eof_rx: Option<Receiver<()>>) {
+        let (tx, rx) = mpsc::channel::<()>();
+        *self.0.poke.lock() = Some(tx.clone());
+        let inner = Arc::clone(&self.0);
+        let _ = std::thread::Builder::new()
+            .name(format!("hem-index-{}", inner.name))
+            .spawn(move || follower_main(inner, path, opts, tx, rx, eof_rx));
     }
 }
 
@@ -637,6 +730,17 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn wait_for(src: &Source, pred: impl Fn(&Source) -> bool) {
+        let start = Instant::now();
+        while !pred(src) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out waiting"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn memory_source_lines() {
         let src = Source::from_bytes("mem", b"one\ntwo\r\nthree".to_vec());
@@ -648,4 +752,97 @@ mod tests {
         assert_eq!(g.line(3), None);
     }
 
+    #[test]
+    fn file_source_indexes_and_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        {
+            let mut f = File::create(&path).unwrap();
+            writeln!(f, "first").unwrap();
+            writeln!(f, "second").unwrap();
+        }
+        let opts = SourceOptions {
+            poll_interval: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let src = Source::open(&path, opts).unwrap();
+        wait_for(&src, |s| s.is_complete() && s.line_count() == 2);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "third").unwrap();
+        }
+        src.poke();
+        wait_for(&src, |s| s.line_count() == 3);
+        assert_eq!(src.read().line(2), Some(&b"third"[..]));
+        src.stop();
+    }
+
+    /// Windows refuses to truncate a file that has a user-mapped section
+    /// open, so in-place truncation can only be exercised on Unix.
+    #[test]
+    #[cfg(unix)]
+    fn truncation_resets_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.log");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let opts = SourceOptions {
+            poll_interval: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let src = Source::open(&path, opts).unwrap();
+        wait_for(&src, |s| s.is_complete() && s.line_count() == 3);
+        let gen0 = src.generation();
+        // Truncate by rewriting a shorter file in place.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"x\n").unwrap();
+        }
+        src.poke();
+        wait_for(&src, |s| s.generation() != gen0 && s.line_count() == 1);
+        assert_eq!(src.read().line(0), Some(&b"x"[..]));
+        assert!(src.take_notices().contains(&Notice::Truncated));
+        src.stop();
+    }
+
+    #[test]
+    fn rotation_reopens_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.log");
+        std::fs::write(&path, "old1\nold2\n").unwrap();
+        let opts = SourceOptions {
+            poll_interval: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let src = Source::open(&path, opts).unwrap();
+        wait_for(&src, |s| s.is_complete() && s.line_count() == 2);
+        let gen0 = src.generation();
+        // Rotate: rename the old file away and create a fresh one.
+        std::fs::rename(&path, dir.path().join("r.log.1")).unwrap();
+        std::fs::write(&path, "new1\n").unwrap();
+        src.poke();
+        wait_for(&src, |s| s.generation() != gen0 && s.line_count() == 1);
+        assert_eq!(src.read().line(0), Some(&b"new1"[..]));
+        let notices = src.take_notices();
+        assert!(notices.contains(&Notice::Rotated), "{notices:?}");
+        src.stop();
+    }
+
+    #[test]
+    fn empty_file_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.log");
+        std::fs::write(&path, "").unwrap();
+        let src = Source::open(&path, SourceOptions::default()).unwrap();
+        wait_for(&src, |s| s.is_complete());
+        assert_eq!(src.line_count(), 0);
+        assert!(src.read().line(0).is_none());
+        src.stop();
+    }
 }
