@@ -21,6 +21,18 @@ say, and stays instant on multi-gigabyte files.
   colourised plain output when piped; sensible exit codes.
 - **Read-only.** hem never modifies the files it opens.
 
+## Install
+
+| Channel | Command |
+|---|---|
+| Shell installer (macOS/Linux) | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/RAZKOM/hem/releases/latest/download/hem-installer.sh \| sh` |
+| PowerShell installer (Windows) | `powershell -ExecutionPolicy Bypass -c "irm https://github.com/RAZKOM/hem/releases/latest/download/hem-installer.ps1 \| iex"` |
+| cargo-binstall | `cargo binstall hem` |
+| cargo | `cargo install hem` |
+| Prebuilt archives | [GitHub Releases](https://github.com/RAZKOM/hem/releases): Windows x64/ARM64, macOS x64/ARM64, Linux x64/ARM64 (musl) |
+
+From source: `cargo install --path .` (Rust 1.89+).
+
 ## Formats
 
 Detected per source from a sample (override with `--format`): JSON lines,
