@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hem-core"]
+members = ["crates/hem-core", "crates/hem-tui"]
 resolver = "2"
 
 [workspace.package]

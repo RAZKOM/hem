@@ -1,0 +1,18 @@
+[package]
+name = "hem-tui"
+description = "ratatui frontend for hem: app state, views, widgets, input, theme."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hem-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+crossterm = "0.29"
+
+[dev-dependencies]
