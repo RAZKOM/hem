@@ -472,6 +472,10 @@ impl View {
             .unwrap_or(Format::Plain)
     }
 
+    pub fn histogram(&self) -> Histogram {
+        self.0.hist.read().clone()
+    }
+
     pub fn stats(&self) -> ViewStats {
         self.0.stats.read().clone()
     }
@@ -488,6 +492,10 @@ impl View {
 
     pub fn generation(&self) -> u32 {
         self.0.generation.load(Ordering::Acquire)
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel.store(true, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -825,6 +833,7 @@ pub fn wait_complete(view: &View, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::FilterSpec;
 
     fn mem(text: &str) -> Base {
         Base::Single(Source::from_bytes("t", text.as_bytes().to_vec()))
@@ -853,6 +862,33 @@ mod tests {
         assert_eq!(v.row(1), Some(Row::new(1, 0, 1)));
         let st = v.stats();
         assert_eq!(st.lines, 3);
+    }
+
+    #[test]
+    fn filtered_view_and_level_inheritance() {
+        let text = "2026-10-13 10:00:00 INFO start\n\
+                    2026-10-13 10:00:01 ERROR boom\n\
+                    \tat Foo.bar(Foo.java:1)\n\
+                    2026-10-13 10:00:02 INFO ok\n\
+                    2026-10-13 10:00:03 WARN hmm\n";
+        let spec = ViewSpec {
+            filter: Filter::from_spec(&FilterSpec {
+                level: Some(Level::Warn),
+                ..Default::default()
+            })
+            .unwrap(),
+            collapse: false,
+        };
+        let v = built(mem(text), spec);
+        let lines: Vec<u64> = v.rows(0, 10).iter().map(|r| r.line()).collect();
+        assert_eq!(lines, vec![1, 2, 4], "stack trace line inherits ERROR");
+        assert_eq!(v.row_for_line(0, 3), 2);
+        assert_eq!(v.row_for_line(0, 2), 1);
+        let h = v.histogram();
+        assert!(h.is_time());
+        assert_eq!(h.total, 3);
+        assert_eq!(v.stats().levels[Level::Error.index()], 1);
+        assert_eq!(v.stats().levels[crate::timeline::NO_LEVEL], 1);
     }
 
     #[test]
@@ -916,5 +952,30 @@ mod tests {
         assert_eq!(v.find_level(4322, Level::Error, true), None);
         let ts = timestamp::civil_to_ms(2026, 10, 13, 10, 10, 0, 0);
         assert_eq!(v.row_for_timestamp(ts), 600);
+    }
+
+    #[test]
+    fn view_follows_growth() {
+        let src = Source::from_bytes("m", b"a\nb\n".to_vec());
+        let v = View::start(
+            Base::Single(src.clone()),
+            ViewSpec {
+                filter: Filter::from_spec(&FilterSpec {
+                    include: vec!["b".into()],
+                    ..Default::default()
+                })
+                .unwrap(),
+                collapse: false,
+            },
+        );
+        assert!(wait_complete(&v, Duration::from_secs(5)));
+        assert_eq!(v.len(), 1);
+        src.append_bytes(b"bb\nc\n");
+        let start = Instant::now();
+        while v.len() < 2 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(v.len(), 2);
+        v.cancel();
     }
 }

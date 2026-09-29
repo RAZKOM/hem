@@ -9,4 +9,6 @@ pub mod app;
 pub mod config;
 pub mod keymap;
 pub mod modal;
+pub mod theme;
+pub mod ui;
 

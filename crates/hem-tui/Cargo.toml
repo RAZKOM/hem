@@ -13,7 +13,9 @@ hem-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 parking_lot.workspace = true
+ratatui = "0.30"
 crossterm = "0.29"
+unicode-width = "0.2"
 directories = "6"
 
 [dev-dependencies]

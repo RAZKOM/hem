@@ -10,8 +10,26 @@ pub struct Input {
 }
 
 impl Input {
+    fn byte_at(&self, idx: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.text.len())
+    }
+
     pub fn len(&self) -> usize {
         self.text.chars().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn insert(&mut self, c: char) {
+        let b = self.byte_at(self.cursor);
+        self.text.insert(b, c);
+        self.cursor += 1;
     }
 
 }
@@ -24,6 +42,24 @@ pub enum TemplateSort {
     First,
     Last,
     Template,
+}
+
+impl TemplateSort {
+    pub const ALL: [TemplateSort; 5] = [
+        TemplateSort::Count,
+        TemplateSort::Level,
+        TemplateSort::First,
+        TemplateSort::Last,
+        TemplateSort::Template,
+    ];
+
+    pub fn next(self) -> TemplateSort {
+        let i = TemplateSort::ALL
+            .iter()
+            .position(|s| *s == self)
+            .unwrap_or(0);
+        TemplateSort::ALL[(i + 1) % TemplateSort::ALL.len()]
+    }
 }
 
 #[derive(Debug, Clone)]

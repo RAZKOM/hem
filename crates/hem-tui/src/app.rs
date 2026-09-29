@@ -55,5 +55,9 @@ impl Tab {
         self.view.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.view.is_empty()
+    }
+
 }
 
