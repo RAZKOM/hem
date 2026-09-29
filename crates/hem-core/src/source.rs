@@ -292,6 +292,59 @@ impl Source {
         Ok(src)
     }
 
+    /// Read stdin into a temp file and follow it.
+    pub fn stdin(opts: SourceOptions) -> Result<Self> {
+        let temp = tempfile::Builder::new()
+            .prefix("hem-stdin-")
+            .tempfile()
+            .map_err(Error::Io)?;
+        let temp_path = temp.path().to_path_buf();
+        let inner = Arc::new(Inner::new(
+            "stdin".to_string(),
+            None,
+            SourceKind::Stdin,
+            &opts,
+        ));
+        *inner._temp.lock() = Some(temp);
+        let src = Source(inner);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let writer_path = temp_path.clone();
+        let src2 = src.clone();
+        std::thread::Builder::new()
+            .name("hem-stdin".into())
+            .spawn(move || {
+                let res = (|| -> std::io::Result<()> {
+                    let mut out = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&writer_path)?;
+                    let stdin = std::io::stdin();
+                    let mut lock = stdin.lock();
+                    let mut buf = vec![0u8; 256 * 1024];
+                    loop {
+                        if src2.0.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let n = lock.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        out.write_all(&buf[..n])?;
+                        out.flush()?;
+                        src2.0.poke();
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = res {
+                    src2.0.push_notice(Notice::Error(format!("stdin: {e}")));
+                }
+                src2.0.poke();
+                let _ = done_tx.send(());
+            })
+            .map_err(Error::Io)?;
+        src.spawn_follower(temp_path, opts, Some(done_rx));
+        Ok(src)
+    }
+
     /// An in-memory source, indexed synchronously.  Handy for tests and for
     /// small pasted inputs.
     pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {

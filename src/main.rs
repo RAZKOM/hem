@@ -5,7 +5,7 @@ mod templates_cmd;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
 
 use hem_core::Level;
@@ -124,6 +124,32 @@ struct ViewArgs {
     color: bool,
 }
 
+/// Expand glob patterns (shells on Windows do not).  Plain paths pass
+/// through unchanged so that a missing file produces a clear error later.
+pub fn expand_globs(args: &[String]) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for a in args {
+        if a.contains(['*', '?', '[']) {
+            let mut matched = 0;
+            for entry in glob::glob(a).with_context(|| format!("bad glob {a:?}"))? {
+                match entry {
+                    Ok(p) if p.is_file() => {
+                        out.push(p);
+                        matched += 1;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(anyhow!("{a}: {e}")),
+                }
+            }
+            if matched == 0 {
+                return Err(anyhow!("no files match {a:?}"));
+            }
+        } else {
+            out.push(PathBuf::from(a));
+        }
+    }
+    Ok(out)
+}
 
 fn main() {
     println!("Hello, world!");

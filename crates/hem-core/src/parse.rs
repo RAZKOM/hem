@@ -59,6 +59,11 @@ fn custom() -> &'static RwLock<Option<CustomPatterns>> {
     C.get_or_init(|| RwLock::new(None))
 }
 
+/// Install (or clear) custom patterns process-wide.
+pub fn set_custom_patterns(p: Option<CustomPatterns>) {
+    *custom().write() = p.filter(|p| p.level.is_some() || p.timestamp.is_some());
+}
+
 fn apply_custom(line: &[u8], meta: &mut LineMeta, default_year: i64) {
     let guard = custom().read();
     let Some(c) = guard.as_ref() else { return };

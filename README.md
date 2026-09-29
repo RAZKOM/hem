@@ -33,6 +33,22 @@ say, and stays instant on multi-gigabyte files.
 
 From source: `cargo install --path .` (Rust 1.89+).
 
+## Quick start
+
+```sh
+hem app.log                         # open in the TUI
+hem app.log nginx.log --merge       # one stream, interleaved by timestamp
+hem 'logs/*.log'                    # globs are expanded by hem (quote them)
+cat app.log | hem                   # stdin
+hem app.log.gz                      # transparent gunzip
+hem app.log -f                      # follow (tail -F), survives rotation
+hem app.log --since 15m --level warn --filter timeout
+hem app.log --level error --plain | wc -l
+hem templates app.log               # most common line templates, as a table
+```
+
+Inside the TUI press `?` for help, `:` for the command palette.
+
 ## Filters
 
 Filters compose: every include pattern must match, no exclude pattern may
