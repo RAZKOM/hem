@@ -308,6 +308,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_colors() {
+        assert_eq!(parse_color("#ff0000"), Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(parse_color("#f00"), Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(parse_color("red"), Some(Color::Red));
+        assert_eq!(parse_color("42"), Some(Color::Indexed(42)));
+        assert_eq!(parse_color("nope"), None);
+    }
+
+    #[test]
     fn overrides() {
         let mut t = Theme::dark();
         let mut o = BTreeMap::new();
