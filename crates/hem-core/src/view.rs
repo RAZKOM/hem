@@ -431,6 +431,47 @@ impl View {
             .unwrap_or(rows.len().saturating_sub(1))
     }
 
+    /// Find the first row whose (inherited) timestamp is `>= ts`, assuming
+    /// rows are roughly chronological.
+    pub fn row_for_timestamp(&self, ts: i64) -> usize {
+        let n = self.len();
+        if n == 0 {
+            return 0;
+        }
+        let probe = |i: usize| -> Option<i64> {
+            // Look at row i and a few before it for a timestamp.
+            let start = i.saturating_sub(8);
+            let chunk = self.chunk(start, i + 1);
+            for k in (0..chunk.len()).rev() {
+                let fmt = self.format_for(chunk.row(k).source());
+                let m = parse_line(chunk.line(k), fmt, self.0.default_year);
+                if let Some(t) = m.ts {
+                    return Some(t);
+                }
+            }
+            None
+        };
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match probe(mid) {
+                Some(t) if t < ts => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        lo.min(n - 1)
+    }
+
+    /// Current (detected or overridden) format of a source.  Resolved on
+    /// every call so detection can settle after the first lines arrive.
+    pub fn format_for(&self, source: u8) -> Format {
+        self.0
+            .base
+            .source(source)
+            .map(|s| s.format())
+            .unwrap_or(Format::Plain)
+    }
+
     pub fn stats(&self) -> ViewStats {
         self.0.stats.read().clone()
     }
@@ -449,6 +490,10 @@ impl View {
         self.0.generation.load(Ordering::Acquire)
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancel.load(Ordering::Acquire)
+    }
+
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
         self.0.wakers.lock().push(w);
     }
@@ -456,6 +501,56 @@ impl View {
     fn wake(&self) {
         for w in self.0.wakers.lock().iter() {
             w();
+        }
+    }
+
+    /// Find the next row at or after `from` (or before, if `!forward`)
+    /// whose level is at least `min`.  Uses the histogram to skip empty
+    /// regions, then scans linearly.
+    pub fn find_level(&self, from: usize, min: Level, forward: bool) -> Option<usize> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        let from = from.min(n - 1);
+        let step = 4096;
+        let mut pos = from;
+        loop {
+            let (a, b) = if forward {
+                (pos, (pos + step).min(n))
+            } else {
+                (pos.saturating_sub(step - 1), pos + 1)
+            };
+            if a >= b {
+                return None;
+            }
+            let chunk = self.chunk(a, b);
+            let indices: Box<dyn Iterator<Item = usize>> = if forward {
+                Box::new(0..chunk.len())
+            } else {
+                Box::new((0..chunk.len()).rev())
+            };
+            for k in indices {
+                let fmt = self.format_for(chunk.row(k).source());
+                let m = parse_line(chunk.line(k), fmt, self.0.default_year);
+                if m.level.map(|l| l >= min).unwrap_or(false) {
+                    return Some(a + k);
+                }
+            }
+            if forward {
+                if b >= n {
+                    return None;
+                }
+                pos = b;
+            } else {
+                if a == 0 {
+                    return None;
+                }
+                pos = a - 1;
+            }
+            if self.is_cancelled() {
+                return None;
+            }
         }
     }
 }
@@ -804,4 +899,22 @@ mod tests {
         assert_eq!(rows[0].count() as usize + rows[1].count() as usize, n);
     }
 
+    #[test]
+    fn find_level_and_timestamp_lookup() {
+        let mut text = String::new();
+        for i in 0..5000 {
+            let lvl = if i == 4321 { "ERROR" } else { "INFO" };
+            text.push_str(&format!(
+                "2026-10-13 10:{:02}:{:02} {lvl} line {i}\n",
+                (i / 60) % 60,
+                i % 60
+            ));
+        }
+        let v = built(mem(&text), ViewSpec::default());
+        assert_eq!(v.find_level(0, Level::Error, true), Some(4321));
+        assert_eq!(v.find_level(4999, Level::Error, false), Some(4321));
+        assert_eq!(v.find_level(4322, Level::Error, true), None);
+        let ts = timestamp::civil_to_ms(2026, 10, 13, 10, 10, 0, 0);
+        assert_eq!(v.row_for_timestamp(ts), 600);
+    }
 }

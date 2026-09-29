@@ -8,6 +8,7 @@ use crate::fields;
 use crate::format::Format;
 use crate::level::Level;
 use crate::parse::LineMeta;
+use crate::timestamp;
 
 /// A compiled text pattern.
 #[derive(Debug, Clone)]
@@ -18,6 +19,36 @@ pub struct Matcher {
 }
 
 impl Matcher {
+    /// Compile a pattern.  `literal` escapes the text.  Case sensitivity is
+    /// "smart": a pattern with no upper-case letters matches case-
+    /// insensitively.
+    pub fn new(text: &str, literal: bool) -> Result<Self> {
+        let smart_ci = !text.chars().any(|c| c.is_uppercase());
+        let body = if literal {
+            regex::escape(text)
+        } else {
+            text.to_string()
+        };
+        let pattern = if smart_ci {
+            format!("(?i){body}")
+        } else {
+            body
+        };
+        let regex = regex::bytes::RegexBuilder::new(&pattern)
+            .size_limit(16 * 1024 * 1024)
+            .dfa_size_limit(8 * 1024 * 1024)
+            .build()
+            .map_err(|e| Error::Regex {
+                pattern: text.to_string(),
+                message: e.to_string(),
+            })?;
+        Ok(Self {
+            text: text.to_string(),
+            regex,
+            literal,
+        })
+    }
+
     #[inline]
     pub fn is_match(&self, line: &[u8]) -> bool {
         self.regex.is_match(line)
@@ -272,6 +303,30 @@ pub struct Filter {
 }
 
 impl Filter {
+    pub fn from_spec(spec: &FilterSpec) -> Result<Self> {
+        let mut f = Filter {
+            spec: spec.clone(),
+            ..Default::default()
+        };
+        for p in &spec.include {
+            f.include.push(Matcher::new(p, spec.literal)?);
+        }
+        for p in &spec.exclude {
+            f.exclude.push(Matcher::new(p, spec.literal)?);
+        }
+        f.min_level = spec.level;
+        if let Some(s) = &spec.since {
+            f.since = Some(timestamp::parse_user(s).ok_or_else(|| Error::BadTime(s.clone()))?);
+        }
+        if let Some(s) = &spec.until {
+            f.until = Some(timestamp::parse_user(s).ok_or_else(|| Error::BadTime(s.clone()))?);
+        }
+        for e in &spec.fields {
+            f.fields.push(FieldPredicate::parse(e)?);
+        }
+        Ok(f)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.include.is_empty()
             && self.exclude.is_empty()
@@ -372,4 +427,66 @@ mod tests {
         assert!(FieldPredicate::parse("=x").is_err());
     }
 
+    #[test]
+    fn composed_filter() {
+        let spec = FilterSpec {
+            include: vec!["timeout".into()],
+            exclude: vec!["ignored".into()],
+            level: Some(Level::Warn),
+            ..Default::default()
+        };
+        let f = Filter::from_spec(&spec).unwrap();
+        let warn = LineMeta {
+            level: Some(Level::Warn),
+            ..Default::default()
+        };
+        let info = LineMeta {
+            level: Some(Level::Info),
+            ..Default::default()
+        };
+        assert!(f.matches(b"WARN request Timeout", &warn, Format::Plain));
+        assert!(!f.matches(b"WARN request Timeout ignored", &warn, Format::Plain));
+        assert!(!f.matches(b"INFO request timeout", &info, Format::Plain));
+        assert!(!f.matches(b"WARN ok", &warn, Format::Plain));
+        assert!(!f.matches(b"x", &LineMeta::default(), Format::Plain));
+        assert_eq!(f.count(), 3);
+    }
+
+    #[test]
+    fn smart_case_and_literal() {
+        let m = Matcher::new("error", false).unwrap();
+        assert!(m.is_match(b"ERROR"));
+        let m = Matcher::new("Error", false).unwrap();
+        assert!(!m.is_match(b"ERROR"));
+        let m = Matcher::new("a.b", true).unwrap();
+        assert!(!m.is_match(b"axb"));
+        assert!(m.is_match(b"A.B"));
+        assert!(Matcher::new("(", false).is_err());
+    }
+
+    #[test]
+    fn time_range() {
+        let spec = FilterSpec {
+            since: Some("2026-10-13T10:00:00Z".into()),
+            until: Some("2026-10-13T11:00:00Z".into()),
+            ..Default::default()
+        };
+        let f = Filter::from_spec(&spec).unwrap();
+        let inside = LineMeta {
+            ts: Some(timestamp::civil_to_ms(2026, 10, 13, 10, 30, 0, 0)),
+            ..Default::default()
+        };
+        let outside = LineMeta {
+            ts: Some(timestamp::civil_to_ms(2026, 10, 13, 12, 0, 0, 0)),
+            ..Default::default()
+        };
+        assert!(f.matches(b"x", &inside, Format::Plain));
+        assert!(!f.matches(b"x", &outside, Format::Plain));
+        assert!(!f.matches(b"x", &LineMeta::default(), Format::Plain));
+        assert!(Filter::from_spec(&FilterSpec {
+            since: Some("never".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
 }

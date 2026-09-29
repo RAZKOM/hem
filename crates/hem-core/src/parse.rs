@@ -270,6 +270,49 @@ impl MetaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamp::civil_to_ms;
+
+    #[test]
+    fn plain_line() {
+        let m = parse_line(b"2026-10-13 10:02:11.204 ERROR boom", Format::Plain, 2026);
+        assert_eq!(m.ts, Some(civil_to_ms(2026, 10, 13, 10, 2, 11, 204)));
+        assert_eq!(m.level, Some(Level::Error));
+        assert_eq!(m.ts_span, Some((0, 23)));
+        assert_eq!(m.level_span, Some((24, 29)));
+    }
+
+    #[test]
+    fn json_line() {
+        let l = br#"{"ts":1791885731.204,"level":30,"msg":"ERROR word in message"}"#;
+        let m = parse_line(l, Format::Json, 2026);
+        assert_eq!(m.ts, Some(1_791_885_731_204));
+        assert_eq!(
+            m.level,
+            Some(Level::Info),
+            "numeric pino level wins over keyword"
+        );
+        let l = br#"{"time":"2026-10-13T10:02:11Z","severity":"WARNING"}"#;
+        let m = parse_line(l, Format::Json, 2026);
+        assert_eq!(m.ts, Some(civil_to_ms(2026, 10, 13, 10, 2, 11, 0)));
+        assert_eq!(m.level, Some(Level::Warn));
+    }
+
+    #[test]
+    fn logfmt_line() {
+        let l = b"ts=2026-10-13T10:02:11Z level=debug msg=\"hello ERROR\"";
+        let m = parse_line(l, Format::Logfmt, 2026);
+        assert_eq!(m.level, Some(Level::Debug));
+        assert_eq!(m.ts, Some(civil_to_ms(2026, 10, 13, 10, 2, 11, 0)));
+        assert_eq!(m.level_span, Some((30, 35)));
+    }
+
+    #[test]
+    fn nginx_line() {
+        let l = br#"1.2.3.4 - - [13/Oct/2026:13:55:36 +0000] "GET / HTTP/1.1" 502 12 "-" "x""#;
+        let m = parse_line(l, Format::Nginx, 2026);
+        assert_eq!(m.level, Some(Level::Error));
+        assert_eq!(m.ts, Some(civil_to_ms(2026, 10, 13, 13, 55, 36, 0)));
+    }
 
     #[test]
     fn stack_trace_line_has_nothing() {

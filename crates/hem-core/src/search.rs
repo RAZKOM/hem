@@ -92,6 +92,29 @@ impl Search {
         self.0.matches.read().binary_search(&(row as u64)).is_ok()
     }
 
+    /// Index (within the match list) and row of the first match after
+    /// `row`, wrapping around.
+    pub fn next_after(&self, row: usize) -> Option<(usize, usize)> {
+        let m = self.0.matches.read();
+        if m.is_empty() {
+            return None;
+        }
+        let p = m.partition_point(|&r| r <= row as u64);
+        let i = if p >= m.len() { 0 } else { p };
+        Some((i, m[i] as usize))
+    }
+
+    /// Index and row of the last match before `row`, wrapping around.
+    pub fn prev_before(&self, row: usize) -> Option<(usize, usize)> {
+        let m = self.0.matches.read();
+        if m.is_empty() {
+            return None;
+        }
+        let p = m.partition_point(|&r| r < row as u64);
+        let i = if p == 0 { m.len() - 1 } else { p - 1 };
+        Some((i, m[i] as usize))
+    }
+
     /// 1-based ordinal of the match at `row`, if any.
     pub fn ordinal_of(&self, row: usize) -> Option<usize> {
         self.0
@@ -232,4 +255,68 @@ pub fn wait_complete(search: &Search, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(5));
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::{Filter, FilterSpec};
+    use crate::source::Source;
+    use crate::view::{Base, ViewSpec};
+
+    fn view(text: &str, spec: ViewSpec) -> View {
+        let v = View::start(
+            Base::Single(Source::from_bytes("t", text.as_bytes().to_vec())),
+            spec,
+        );
+        assert!(crate::view::wait_complete(&v, Duration::from_secs(5)));
+        v
+    }
+
+    #[test]
+    fn finds_rows_identity() {
+        let mut text = String::new();
+        for i in 0..100_000 {
+            text.push_str(if i % 1000 == 7 {
+                "needle here\n"
+            } else {
+                "hay\n"
+            });
+        }
+        let v = view(&text, ViewSpec::default());
+        let s = Search::start(v, Matcher::new("needle", false).unwrap());
+        assert!(wait_complete(&s, Duration::from_secs(10)));
+        assert_eq!(s.count(), 100);
+        assert_eq!(s.next_after(0), Some((0, 7)));
+        assert_eq!(s.next_after(7), Some((1, 1007)));
+        assert_eq!(s.prev_before(7), Some((99, 99007)), "wraps");
+        assert_eq!(s.ordinal_of(1007), Some(2));
+        assert!(s.contains(2007));
+        assert!(!s.contains(2008));
+    }
+
+    #[test]
+    fn finds_rows_filtered() {
+        let text = "a 1\nb 2\na 3\nb needle 4\na needle 5\n";
+        let spec = ViewSpec {
+            filter: Filter::from_spec(&FilterSpec {
+                include: vec!["^a".into()],
+                ..Default::default()
+            })
+            .unwrap(),
+            collapse: false,
+        };
+        let v = view(text, spec);
+        let s = Search::start(v, Matcher::new("needle", false).unwrap());
+        assert!(wait_complete(&s, Duration::from_secs(5)));
+        assert_eq!(s.matches(), vec![2]);
+    }
+
+    #[test]
+    fn multiple_matches_per_line_count_once() {
+        let v = view("xx xx\nyy\nxx\n", ViewSpec::default());
+        let s = Search::start(v, Matcher::new("xx", false).unwrap());
+        assert!(wait_complete(&s, Duration::from_secs(5)));
+        assert_eq!(s.matches(), vec![0, 2]);
+    }
 }
