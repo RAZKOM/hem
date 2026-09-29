@@ -1,5 +1,6 @@
 //! `hem`: Human-readable Event Monitor.  *tail, but tailored.*
 
+mod plain;
 mod templates_cmd;
 
 use std::io::IsTerminal;
