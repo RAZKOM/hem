@@ -701,6 +701,7 @@ dependencies = [
  "clap",
  "glob",
  "hem-core",
+ "hem-tui",
 ]
 
 [[package]]
