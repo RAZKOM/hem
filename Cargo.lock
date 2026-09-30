@@ -731,6 +731,7 @@ dependencies = [
  "crossterm",
  "directories",
  "hem-core",
+ "memchr",
  "parking_lot",
  "ratatui",
  "regex",
