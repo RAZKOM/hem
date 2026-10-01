@@ -480,6 +480,20 @@ impl View {
         self.0.stats.read().clone()
     }
 
+    /// Base rows consumed so far.
+    pub fn consumed(&self) -> u64 {
+        self.0.consumed.load(Ordering::Acquire)
+    }
+
+    /// Fraction of the base processed.
+    pub fn progress(&self) -> f64 {
+        let total = self.0.base.len() as f64;
+        if total == 0.0 {
+            return 1.0;
+        }
+        (self.consumed() as f64 / total).clamp(0.0, 1.0)
+    }
+
     /// True when every base row currently available has been processed.
     pub fn is_complete(&self) -> bool {
         self.0.complete.load(Ordering::Acquire)

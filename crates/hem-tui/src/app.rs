@@ -15,6 +15,7 @@ use hem_core::filter::{Filter, Matcher};
 use hem_core::merge::Merged;
 use hem_core::parse::MetaCache;
 use hem_core::search::Search;
+use hem_core::source::Notice as SourceNotice;
 use hem_core::timestamp::TsDisplay;
 use hem_core::view::{Base, Row, View, ViewSpec};
 use hem_core::{Level, Source};
@@ -22,8 +23,9 @@ use hem_core::{Level, Source};
 use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::keymap::{Action, KeyMap};
-use crate::modal::{Modal, TemplatesState};
-use crate::theme::Theme;
+use crate::modal::{Modal, TemplateSort, TemplatesState};
+use crate::theme::{Depth, Theme};
+use crate::RunOptions;
 
 /// Something clickable, recorded during render.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,14 +210,108 @@ pub enum PaletteItem {
 }
 
 impl App {
+    pub fn new(opts: RunOptions) -> Result<App> {
+        let depth = Depth::detect();
+        let theme_name = opts
+            .theme
+            .clone()
+            .or_else(|| opts.config.theme.clone())
+            .unwrap_or_else(|| "dark".into());
+        let mut theme = Theme::by_name(&theme_name).unwrap_or_else(Theme::dark);
+        let bad = theme.apply_overrides(&opts.config.colors);
+        theme = theme.adapt(depth);
+        let mut keymap = KeyMap::default();
+        let key_errors = keymap.apply_overrides(&opts.config.keys);
+
+        let defaults = &opts.config.defaults;
+        let collapse = opts.collapse.unwrap_or(defaults.collapse);
+        let follow = opts.follow || defaults.follow;
+        let filter = Filter::from_spec(&opts.initial_filter)?;
+        let dirty = Arc::new(AtomicBool::new(true));
+        let wake: Arc<dyn Fn() + Send + Sync> = {
+            let d = Arc::clone(&dirty);
+            Arc::new(move || d.store(true, Ordering::Release))
+        };
+
+        let mut tabs = Vec::new();
+        for src in &opts.sources {
+            src.add_waker(Arc::clone(&wake));
+            let tab = Tab::new(
+                src.name().to_string(),
+                Base::Single(src.clone()),
+                filter.clone(),
+                collapse,
+                follow,
+                defaults.wrap,
+                defaults.columns,
+            );
+            tab.view.add_waker(Arc::clone(&wake));
+            tabs.push(tab);
+        }
+        let mut app = App {
+            tabs,
+            active: 0,
+            config: opts.config.clone(),
+            config_path: opts.config_path.clone(),
+            theme,
+            keymap,
+            modal: None,
+            templates_mode: false,
+            notices: VecDeque::new(),
+            quit: false,
+            ascii: opts.ascii || defaults.ascii,
+            mouse: opts.mouse && defaults.mouse,
+            minimap: defaults.minimap,
+            ts_display: defaults.timestamp,
+            hits: Vec::new(),
+            chips: Vec::new(),
+            clipboard: Clipboard::new(),
+            debug: None,
+            size: (80, 24),
+            dirty,
+            osc52: None,
+            minimap_drag: false,
+            last_progress: String::new(),
+            cluster_cap: if defaults.cluster_cap == 0 {
+                usize::MAX / 2
+            } else {
+                defaults.cluster_cap
+            },
+            palette_items: Vec::new(),
+            wake,
+        };
+        if opts.merge && opts.sources.len() > 1 {
+            app.add_merged_tab(opts.sources.clone(), filter.clone(), collapse, follow);
+            app.active = app.tabs.len() - 1;
+        }
+        for b in bad {
+            app.notice_warn(format!("config: unknown colour {b}"));
+        }
+        for e in key_errors {
+            app.notice_warn(format!("config: {e}"));
+        }
+        if app.tabs.is_empty() {
+            anyhow::bail!("no sources");
+        }
+        Ok(app)
+    }
+
     // --- Accessors ------------------------------------------------------
 
     pub fn tab(&self) -> &Tab {
         &self.tabs[self.active.min(self.tabs.len() - 1)]
     }
 
+    pub fn take_dirty(&mut self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn animating(&self) -> bool {
+        false
     }
 
     pub fn log_debug(&mut self, msg: &str) {
@@ -244,6 +340,109 @@ impl App {
     }
 
     // --- Periodic update ---------------------------------------------------
+
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        let before = self.notices.len();
+        self.notices.retain(|n| n.until > now);
+        if self.notices.len() != before {
+            self.mark_dirty();
+        }
+        // Source notices.
+        let mut msgs = Vec::new();
+        for t in &self.tabs {
+            for s in t.base.sources() {
+                for n in s.take_notices() {
+                    msgs.push(match n {
+                        SourceNotice::Truncated => {
+                            (format!("{}: file truncated, re-indexed", s.name()), true)
+                        }
+                        SourceNotice::Rotated => {
+                            (format!("{}: file rotated, re-opened", s.name()), true)
+                        }
+                        SourceNotice::Removed => (
+                            format!("{}: file removed (still showing last contents)", s.name()),
+                            true,
+                        ),
+                        SourceNotice::Error(e) => (format!("{}: {e}", s.name()), true),
+                    });
+                }
+            }
+        }
+        for (m, w) in msgs {
+            self.push_notice(m, w);
+        }
+        // View generation changes (rotation) reset positions.
+        for t in &mut self.tabs {
+            let g = t.view.generation();
+            if g != t.view_gen {
+                t.view_gen = g;
+                t.top = 0;
+                t.cursor = 0;
+                t.expanded.clear();
+                t.member_cache.clear();
+                t.meta.clear();
+            }
+            // Pending anchor after a view rebuild.
+            if let Some((src, line)) = t.pending_anchor {
+                let n = t.len();
+                if n > 0 {
+                    let pos = t.view.row_for_line(src, line);
+                    if t.view.is_complete() || pos + 1 < n {
+                        t.cursor = pos.min(n - 1);
+                        t.top = t.cursor.saturating_sub(t.last_height / 3);
+                        t.pending_anchor = None;
+                    }
+                } else if t.view.is_complete() && t.base.is_complete() {
+                    t.pending_anchor = None;
+                }
+            }
+            // Follow.
+            let n = t.len();
+            if t.follow && n != t.last_len {
+                t.cursor = n.saturating_sub(1);
+                t.top = n.saturating_sub(t.last_height.max(1));
+            }
+            if n != t.last_len {
+                t.last_len = n;
+            }
+        }
+        // Progress text changes should redraw.
+        let p = self.progress_text();
+        if p != self.last_progress {
+            self.last_progress = p;
+            self.mark_dirty();
+        }
+    }
+
+    /// Short indexing / search progress summary for the status bar.
+    pub fn progress_text(&self) -> String {
+        let t = self.tab();
+        let mut parts = Vec::new();
+        for s in t.base.sources() {
+            if !s.is_complete() {
+                parts.push(format!(
+                    "indexing {} {:.0}%",
+                    s.name(),
+                    s.progress() * 100.0
+                ));
+            }
+        }
+        if !t.view.is_complete() && t.base.is_complete() {
+            parts.push(format!("filtering {:.0}%", t.view.progress() * 100.0));
+        }
+        if let Some(s) = &t.search {
+            if !s.is_complete() {
+                parts.push(format!("searching {:.0}%", s.progress() * 100.0));
+            }
+        }
+        if let Some(c) = &t.clusters {
+            if !c.is_complete() {
+                parts.push(format!("clustering {:.0}%", c.progress() * 100.0));
+            }
+        }
+        parts.join(" · ")
+    }
 
     // --- Tabs & sources -----------------------------------------------------
 
@@ -277,7 +476,74 @@ impl App {
 
     // --- Modals ---------------------------------------------------------------
 
+    /// Templates sorted for display.
+    pub fn sorted_templates(&self) -> Vec<Template> {
+        let t = self.tab();
+        let Some(c) = &t.clusters else {
+            return Vec::new();
+        };
+        let mut v: Vec<Template> = c.templates().iter().cloned().collect();
+        let q = t.templates.filter.text.to_lowercase();
+        if !q.is_empty() {
+            v.retain(|t| t.display().to_lowercase().contains(&q));
+        }
+        let st = &t.templates;
+        v.sort_by(|a, b| {
+            let ord = match st.sort {
+                TemplateSort::Count => a.count.cmp(&b.count),
+                TemplateSort::Level => a.max_level().cmp(&b.max_level()),
+                TemplateSort::First => a.first_ts.cmp(&b.first_ts).then(a.first.cmp(&b.first)),
+                TemplateSort::Last => a.last_ts.cmp(&b.last_ts).then(a.last.cmp(&b.last)),
+                TemplateSort::Template => a.display().cmp(&b.display()),
+            };
+            if st.ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+        v
+    }
+
     // --- Chips -------------------------------------------------------------
+
+    /// Rebuild the chip list from the active filter (called by the renderer).
+    pub fn compute_chips(&mut self) -> Vec<(Chip, String)> {
+        let t = self.tab();
+        let f = &t.filter;
+        let mut v = Vec::new();
+        for (i, m) in f.include.iter().enumerate() {
+            v.push((Chip::Include(i), format!("filter: {}", m.text)));
+        }
+        for (i, m) in f.exclude.iter().enumerate() {
+            v.push((Chip::Exclude(i), format!("exclude: {}", m.text)));
+        }
+        if let Some(l) = f.min_level {
+            v.push((Chip::Level, format!("level ≥ {l}")));
+        }
+        if f.since.is_some() || f.until.is_some() {
+            let s = f.spec.since.clone().unwrap_or_else(|| "…".into());
+            let u = f.spec.until.clone().unwrap_or_else(|| "…".into());
+            v.push((Chip::Time, format!("{s} → {u}")));
+        }
+        for (i, p) in f.fields.iter().enumerate() {
+            v.push((Chip::Field(i), p.display()));
+        }
+        if let Some(tm) = &f.template {
+            v.push((
+                Chip::Template,
+                format!("template: {}", truncate(&tm.display(), 40)),
+            ));
+        }
+        if !t.search_text.is_empty() {
+            v.push((Chip::Search, format!("/{}", t.search_text)));
+        }
+        if let Some(h) = &t.highlight {
+            v.push((Chip::Highlight, format!("highlight: {}", h.text)));
+        }
+        self.chips = v.iter().map(|(c, _)| c.clone()).collect();
+        v
+    }
 
     // --- Input ---------------------------------------------------------------
 
@@ -285,3 +551,12 @@ impl App {
 
 }
 
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}

@@ -74,6 +74,41 @@ needed. Items marked **review** deserve a look from the owner.
   group is used before the built-in detectors. Selected with
   `--format <name>`.
 
+## Terminal UI
+
+- **Scrolling is row-based**, not display-line based. With wrap on, a long
+  top row shows from its first display line; `top` always points at a row.
+  This keeps every scroll operation O(1) and avoids re-measuring rows.
+- **Expanding a collapsed run** shows up to 500 member lines inline (`x`);
+  the detail view (`Enter`) shows the representative line with fields and
+  context. Members are found by scanning forward from the representative
+  line (bounded to 200 k lines), which is exact for single-source views and
+  approximate for merged ones.
+- **Prompts are inline, modals are centred.** Search / filter / go-to use a
+  one-line prompt in the filter-bar slot (like Vim / less); everything else
+  is a centred, dimmed-background modal with the focus trapped inside.
+  Clicking outside a modal closes it.
+- **The keymap is the single source of truth** for the help modal and the
+  command palette; config overrides replace an action's bindings entirely.
+- **Settings auto-save** to the config file on every change (and `s` saves
+  explicitly). Saving rewrites the whole file through the serializer, so
+  comments in a hand-written config are lost. **review**: switch to
+  `toml_edit` if comment preservation matters.
+- **Colour depth** is detected from `COLORTERM`, `WT_SESSION`,
+  `TERM_PROGRAM` and `TERM`; `HEM_COLORS=16|256|truecolor|mono` overrides.
+  On Windows with none of those set we assume 24-bit colour (conhost on
+  Windows 10+ supports it). `NO_COLOR` drops to a monochrome theme that uses
+  bold / reverse / underline only.
+- **Mouse clicks are hit-tested against regions recorded during render**
+  (`App::hits`), which keeps the renderer and the input code decoupled and
+  makes clickable elements testable with `TestBackend`.
+- **Redraws are coalesced to ~60 fps**; when nothing is running the event
+  loop polls every 200 ms, so idle CPU is effectively 0 %. Background jobs
+  set a dirty flag instead of pushing events.
+- **Copy** uses `arboard` and falls back to OSC 52; over SSH (`SSH_TTY`
+  set) or with `HEM_OSC52=1` it goes straight to OSC 52 so the *local*
+  terminal gets the text.
+
 ## CLI / plain mode
 
 - `--follow` is `-f` (tail convention); `--filter` has no short flag.

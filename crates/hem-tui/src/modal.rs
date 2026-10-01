@@ -33,6 +33,11 @@ impl Input {
         self.cursor += 1;
     }
 
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
 }
 
 /// What an inline prompt is for.
@@ -102,6 +107,16 @@ impl TemplateSort {
         TemplateSort::Last,
         TemplateSort::Template,
     ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TemplateSort::Count => "count",
+            TemplateSort::Level => "level",
+            TemplateSort::First => "first seen",
+            TemplateSort::Last => "last seen",
+            TemplateSort::Template => "template",
+        }
+    }
 
     pub fn next(self) -> TemplateSort {
         let i = TemplateSort::ALL

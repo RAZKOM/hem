@@ -439,6 +439,15 @@ impl Source {
         self.0.stats.generation.load(Ordering::Acquire)
     }
 
+    /// Indexing progress in `0.0..=1.0`.
+    pub fn progress(&self) -> f64 {
+        let total = self.total_bytes();
+        if total == 0 {
+            return if self.is_complete() { 1.0 } else { 0.0 };
+        }
+        (self.indexed_bytes() as f64 / total as f64).clamp(0.0, 1.0)
+    }
+
     /// Drain pending notices.
     pub fn take_notices(&self) -> Vec<Notice> {
         std::mem::take(&mut *self.0.notices.lock())

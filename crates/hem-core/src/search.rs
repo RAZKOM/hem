@@ -79,6 +79,15 @@ impl Search {
         self.0.complete.load(Ordering::Acquire)
     }
 
+    pub fn progress(&self) -> f64 {
+        let n = self.0.view.len() as f64;
+        if n == 0.0 {
+            1.0
+        } else {
+            (self.0.scanned.load(Ordering::Acquire) as f64 / n).clamp(0.0, 1.0)
+        }
+    }
+
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
         self.0.wakers.lock().push(w);
     }

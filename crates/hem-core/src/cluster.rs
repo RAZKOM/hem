@@ -369,6 +369,11 @@ impl Clusters {
         Arc::clone(&self.0.snapshot.read())
     }
 
+    /// Lines processed so far.
+    pub fn processed(&self) -> u64 {
+        self.0.processed.load(Ordering::Acquire)
+    }
+
     /// Sampling stride (1 = every line).
     pub fn stride(&self) -> u64 {
         self.0.stride.load(Ordering::Acquire)
@@ -380,6 +385,14 @@ impl Clusters {
 
     pub fn is_complete(&self) -> bool {
         self.0.complete.load(Ordering::Acquire)
+    }
+
+    pub fn progress(&self) -> f64 {
+        let total = self.0.base.len() as f64;
+        if total == 0.0 {
+            return 1.0;
+        }
+        ((self.processed() * self.stride()) as f64 / total).clamp(0.0, 1.0)
     }
 
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {

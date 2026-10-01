@@ -136,3 +136,22 @@ full screen; the event loop coalesces to 60 fps and idles at 200 ms polls.
 Micro-benchmarks: `cargo bench` (`benches/index.rs`, `benches/search.rs`;
 set `HEM_BENCH_FILE=path` to index a real file).
 
+## Development
+
+```sh
+cargo test --workspace                 # unit, integration and TestBackend rendering tests
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+cargo run --release --example genlog -- --size 1G --out testdata/big-1g.log
+cargo run -- testdata/big-1g.log --debug   # writes ./hem-debug.log
+```
+
+Layout: `crates/hem-core` (no terminal deps: indexing, parsing, search,
+clustering, timeline, merge), `crates/hem-tui` (ratatui app), `src/main.rs`
+(CLI, plain mode, `templates` subcommand), `tests/`, `benches/`, `testdata/`.
+Design notes and trade-offs are in [DECISIONS.md](DECISIONS.md).
+
+Releases: tag `v*` to run `.github/workflows/release.yml` (cargo-dist),
+which builds all six targets, uploads them to GitHub Releases and generates
+the shell / PowerShell installers.
+
