@@ -3,5 +3,6 @@
 
 pub mod bars;
 pub mod line;
+pub mod templates;
 pub mod widgets;
 

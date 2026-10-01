@@ -49,6 +49,18 @@ impl Level {
         }
     }
 
+    /// Three-letter badge.
+    pub fn short(self) -> &'static str {
+        match self {
+            Level::Trace => "TRC",
+            Level::Debug => "DBG",
+            Level::Info => "INF",
+            Level::Warn => "WRN",
+            Level::Error => "ERR",
+            Level::Fatal => "FTL",
+        }
+    }
+
     /// Parse a level name (case-insensitive, accepts common aliases and
     /// numeric syslog / pino levels).
     pub fn parse(s: &str) -> Option<Level> {

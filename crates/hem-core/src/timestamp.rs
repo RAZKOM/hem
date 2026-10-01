@@ -408,6 +408,32 @@ pub enum TsDisplay {
     Relative,
 }
 
+/// Format epoch milliseconds for display.
+pub fn format_ms(ms: i64, style: TsDisplay, origin: Option<i64>) -> String {
+    let dt: Option<DateTime<Utc>> = DateTime::from_timestamp_millis(ms);
+    match style {
+        TsDisplay::Original | TsDisplay::Iso => dt
+            .map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+            .unwrap_or_default(),
+        TsDisplay::Time => dt
+            .map(|d| d.format("%H:%M:%S%.3f").to_string())
+            .unwrap_or_default(),
+        TsDisplay::Local => dt
+            .map(|d| {
+                d.with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S%.3f")
+                    .to_string()
+            })
+            .unwrap_or_default(),
+        TsDisplay::Relative => {
+            let rel = ms - origin.unwrap_or(ms);
+            let sign = if rel < 0 { "-" } else { "+" };
+            let rel = rel.abs();
+            format!("{sign}{}.{:03}s", rel / 1000, rel % 1000)
+        }
+    }
+}
+
 /// Human-friendly short form for axis labels: picks a precision suited to
 /// the span being labelled.
 pub fn format_axis(ms: i64, span_ms: i64) -> String {
