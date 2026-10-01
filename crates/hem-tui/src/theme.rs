@@ -389,8 +389,83 @@ impl Theme {
         }
     }
 
+    pub fn dim_style(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(self.dim)
+        }
+    }
+
+    pub fn level_style(&self, level: Level) -> Style {
+        if self.is_mono() {
+            return match level {
+                Level::Error | Level::Fatal => {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                }
+                Level::Warn => Style::default().add_modifier(Modifier::BOLD),
+                _ => Style::default(),
+            };
+        }
+        let s = Style::default().fg(self.levels[level.index()]);
+        match level {
+            Level::Error | Level::Fatal => s.add_modifier(Modifier::BOLD),
+            _ => s,
+        }
+    }
+
     pub fn level_color(&self, level: Level) -> Color {
         self.levels[level.index()]
+    }
+
+    pub fn source_style(&self, idx: usize) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(self.sources[idx % self.sources.len()])
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    pub fn selection(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().bg(self.cursor_bg)
+        }
+    }
+
+    pub fn accent_style(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.accent)
+        }
+    }
+
+    pub fn title_style(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.title).add_modifier(Modifier::BOLD)
+        }
+    }
+
+    pub fn fg_style(&self, c: Color) -> Style {
+        if self.is_mono() {
+            Style::default()
+        } else {
+            Style::default().fg(c)
+        }
+    }
+
+    pub fn input(&self) -> Style {
+        if self.is_mono() {
+            Style::default()
+        } else {
+            Style::default().fg(self.fg).bg(self.input_bg)
+        }
     }
 
     pub fn tab(&self, active: bool) -> Style {

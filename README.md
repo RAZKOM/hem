@@ -110,6 +110,61 @@ hem templates app.log --json | jq .
 Exit codes: `0` ok, `1` runtime error (unreadable file, bad regex, bad
 config), `2` usage error.
 
+## Configuration
+
+`%APPDATA%\hem\config.toml` on Windows, `~/.config/hem/config.toml`
+elsewhere (`--config` overrides). Every key is optional; unknown keys are
+reported with their line number instead of being ignored.
+
+```toml
+theme = "dark"            # or "light"
+
+[colors]                  # override any theme colour: #rrggbb, #rgb, an ANSI name, or 0-255
+error = "#ff5d8f"
+timestamp = "gray"
+# names: bg fg dim accent border border_focus selection cursor timestamp
+#        trace debug info warn error fatal json_key string number url match
+#        current_match highlight pin status_bg status_fg modal_bg modal_border
+#        sparkline minimap_bg
+
+[keys]                    # action = "key" or ["key", "key"]; replaces the default binding
+next_error = ["e", "ctrl+n"]
+quit = "ctrl+q"
+# key syntax: a, G, ctrl+p, alt+x, shift+tab, pgup, pgdn, home, end, enter, esc, space, f1..f12
+# actions: scroll_up scroll_down scroll_left scroll_right page_up page_down half_page_up
+#   half_page_down top bottom toggle_follow search next_match prev_match clear_search filter
+#   exclude field_filter filter_editor clear_filters cycle_level next_error prev_error
+#   toggle_collapse expand templates detail pin highlight_value clear_highlight copy copy_view
+#   toggle_wrap toggle_columns cycle_timestamp next_tab prev_tab sources open_file goto palette
+#   settings help close quit sort_templates sort_templates_reverse refresh
+
+[defaults]
+collapse = true           # collapse repeated lines
+wrap = false
+follow = false
+timestamp = "original"    # original | time | iso | local | relative
+ascii = false             # ASCII box drawing / symbols
+mouse = true
+columns = false           # field columns for JSON/logfmt sources
+minimap = true
+cluster_cap = 2000000     # lines sampled for templates (0 = all)
+
+[presets.errors]          # hem --preset errors, or "Preset: errors" in the palette
+level = "warn"
+include = ["timeout"]
+exclude = ["healthz"]
+fields = ["status>=500"]
+since = "1h"
+
+[formats.myapp]           # hem --format myapp
+base = "plain"            # plain | json | logfmt | syslog | nginx
+level_regex = '\[(\w+)\]'          # first capture group is the level
+timestamp_regex = '^(\d{8}T\d{6})' # first capture group is parsed as a timestamp
+```
+
+Environment: `NO_COLOR` disables colour; `HEM_COLORS=16|256|truecolor|mono`
+forces a colour depth; `HEM_OSC52=1` forces OSC 52 clipboard.
+
 ## Performance
 
 Measured with `cargo run --release --example perf -- <file>` on synthetic

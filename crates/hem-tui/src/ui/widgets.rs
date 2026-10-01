@@ -25,6 +25,30 @@ pub fn fit(s: &str, width: usize, ascii: bool) -> String {
     out
 }
 
+/// Pad / truncate to exactly `width` columns.
+pub fn pad(s: &str, width: usize, ascii: bool) -> String {
+    let t = fit(s, width, ascii);
+    let w = t.width();
+    if w < width {
+        format!("{t}{}", " ".repeat(width - w))
+    } else {
+        t
+    }
+}
+
+/// Format a number with thousands separators.
+pub fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Human-readable byte size.
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];

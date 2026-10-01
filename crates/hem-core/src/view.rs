@@ -236,6 +236,13 @@ impl Base {
         }
     }
 
+    /// Bytes of a single line.
+    pub fn line_bytes(&self, row: Row) -> Option<Vec<u8>> {
+        let s = self.source(row.source())?;
+        let g = s.read();
+        g.line(row.line() as usize).map(|l| l.to_vec())
+    }
+
     /// Scan the last bytes of the (first) source for a timestamp, used to
     /// size the timeline before indexing completes.
     fn last_timestamp_hint(&self, default_year: i64) -> Option<i64> {
@@ -470,6 +477,10 @@ impl View {
             .source(source)
             .map(|s| s.format())
             .unwrap_or(Format::Plain)
+    }
+
+    pub fn default_year(&self) -> i64 {
+        self.0.default_year
     }
 
     pub fn histogram(&self) -> Histogram {
