@@ -121,3 +121,12 @@ needed. Items marked **review** deserve a look from the owner.
   input parsing; the hot-path timestamp parser is hand written.
 - `criterion` with default features off: benchmarks only.
 
+## Known gaps
+
+- Follow-mode throughput at 10 k lines/s has not been measured on a real
+  writer; the design (250 ms poll + notify, incremental index/view/search)
+  is built for it. The 5 GB index runs at ~2.5 GB/s from page cache.
+- `--debug` logs actions and notices, not every event.
+- There is no asciinema recording yet (placeholder in the README).
+- Light theme and 16-colour degradation have been checked by eye in tests
+  only (`TestBackend`), not on a wide range of real terminals.

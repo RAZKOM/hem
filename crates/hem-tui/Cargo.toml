@@ -14,12 +14,15 @@ anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true
 regex.workspace = true
+chrono.workspace = true
 parking_lot.workspace = true
 ratatui = "0.30"
 crossterm = "0.29"
 unicode-width = "0.2"
 memchr.workspace = true
 directories = "6"
+arboard = { version = "3", default-features = false }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

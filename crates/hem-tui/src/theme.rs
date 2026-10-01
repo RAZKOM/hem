@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use hem_core::Level;
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 
 /// How many colours the terminal can show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +12,59 @@ pub enum Depth {
     Ansi16,
     Ansi256,
     TrueColor,
+}
+
+impl Depth {
+    /// Detect from the environment.
+    pub fn detect() -> Depth {
+        if std::env::var_os("NO_COLOR")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return Depth::Mono;
+        }
+        if let Ok(v) = std::env::var("HEM_COLORS") {
+            match v.as_str() {
+                "16" => return Depth::Ansi16,
+                "256" => return Depth::Ansi256,
+                "truecolor" | "24bit" => return Depth::TrueColor,
+                "0" | "mono" => return Depth::Mono,
+                _ => {}
+            }
+        }
+        if let Ok(ct) = std::env::var("COLORTERM") {
+            let ct = ct.to_ascii_lowercase();
+            if ct.contains("truecolor") || ct.contains("24bit") {
+                return Depth::TrueColor;
+            }
+        }
+        if std::env::var_os("WT_SESSION").is_some()
+            || std::env::var("TERM_PROGRAM")
+                .map(|p| {
+                    let p = p.to_ascii_lowercase();
+                    p.contains("vscode")
+                        || p.contains("iterm")
+                        || p.contains("wezterm")
+                        || p.contains("ghostty")
+                })
+                .unwrap_or(false)
+        {
+            return Depth::TrueColor;
+        }
+        if let Ok(term) = std::env::var("TERM") {
+            if term.contains("256color") || term.contains("direct") {
+                return Depth::Ansi256;
+            }
+            if term == "dumb" {
+                return Depth::Mono;
+            }
+        }
+        if cfg!(windows) {
+            // Modern conhost on Windows 10+ supports 24-bit colour.
+            return Depth::TrueColor;
+        }
+        Depth::Ansi16
+    }
 }
 
 /// Named theme styles.
@@ -254,7 +307,19 @@ impl Theme {
         unknown
     }
 
+    pub fn is_mono(&self) -> bool {
+        self.depth == Depth::Mono
+    }
+
     // --- Convenience styles -------------------------------------------
+
+    pub fn base(&self) -> Style {
+        if self.is_mono() {
+            Style::default()
+        } else {
+            Style::default().fg(self.fg).bg(self.bg)
+        }
+    }
 
     pub fn level_color(&self, level: Level) -> Color {
         self.levels[level.index()]
@@ -301,6 +366,117 @@ pub fn parse_color(s: &str) -> Option<Color> {
         "reset" | "default" | "none" => Color::Reset,
         _ => return None,
     })
+}
+
+/// Map an RGB colour to the nearest colour the terminal supports.
+pub fn adapt_color(c: Color, depth: Depth) -> Color {
+    let Color::Rgb(r, g, b) = c else {
+        return match depth {
+            Depth::Mono => Color::Reset,
+            _ => c,
+        };
+    };
+    match depth {
+        Depth::TrueColor => c,
+        Depth::Ansi256 => Color::Indexed(nearest_256(r, g, b)),
+        Depth::Ansi16 => nearest_16(r, g, b),
+        Depth::Mono => Color::Reset,
+    }
+}
+
+fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
+    // Greys.
+    let is_grey = r.abs_diff(g) < 8 && g.abs_diff(b) < 8;
+    if is_grey {
+        let v = ((r as u32 + g as u32 + b as u32) / 3) as u8;
+        if v < 8 {
+            return 16;
+        }
+        if v > 238 {
+            return 231;
+        }
+        return 232 + ((v as u32 - 8) * 24 / 230).min(23) as u8;
+    }
+    let q = |v: u8| -> u8 {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            ((v as u32 - 35) / 40).min(5) as u8
+        }
+    };
+    16 + 36 * q(r) + 6 * q(g) + q(b)
+}
+
+fn nearest_16(r: u8, g: u8, b: u8) -> Color {
+    let lum = (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000;
+    let bright = lum > 150;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    if max - min < 30 {
+        return if lum < 60 {
+            Color::Black
+        } else if lum < 140 {
+            Color::DarkGray
+        } else if lum < 210 {
+            Color::Gray
+        } else {
+            Color::White
+        };
+    }
+    let hi = |v: u8| v as u32 * 100 / max as u32 > 60;
+    match (hi(r), hi(g), hi(b)) {
+        (true, false, false) => {
+            if bright {
+                Color::LightRed
+            } else {
+                Color::Red
+            }
+        }
+        (false, true, false) => {
+            if bright {
+                Color::LightGreen
+            } else {
+                Color::Green
+            }
+        }
+        (false, false, true) => {
+            if bright {
+                Color::LightBlue
+            } else {
+                Color::Blue
+            }
+        }
+        (true, true, false) => {
+            if bright {
+                Color::LightYellow
+            } else {
+                Color::Yellow
+            }
+        }
+        (true, false, true) => {
+            if bright {
+                Color::LightMagenta
+            } else {
+                Color::Magenta
+            }
+        }
+        (false, true, true) => {
+            if bright {
+                Color::LightCyan
+            } else {
+                Color::Cyan
+            }
+        }
+        _ => {
+            if bright {
+                Color::White
+            } else {
+                Color::Gray
+            }
+        }
+    }
 }
 
 #[cfg(test)]
