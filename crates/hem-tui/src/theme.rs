@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use hem_core::Level;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 /// How many colours the terminal can show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +307,74 @@ impl Theme {
         unknown
     }
 
+    /// Reduce every colour to what the terminal supports.
+    pub fn adapt(mut self, depth: Depth) -> Theme {
+        self.depth = depth;
+        if depth == Depth::TrueColor {
+            return self;
+        }
+        let f = |c: &mut Color| *c = adapt_color(*c, depth);
+        for c in [
+            &mut self.bg,
+            &mut self.fg,
+            &mut self.dim,
+            &mut self.accent,
+            &mut self.border,
+            &mut self.border_focus,
+            &mut self.selection_bg,
+            &mut self.cursor_bg,
+            &mut self.timestamp,
+            &mut self.json_key,
+            &mut self.string,
+            &mut self.number,
+            &mut self.url,
+            &mut self.match_bg,
+            &mut self.match_fg,
+            &mut self.current_match_bg,
+            &mut self.highlight_bg,
+            &mut self.pin,
+            &mut self.chip_bg,
+            &mut self.chip_fg,
+            &mut self.chip_close,
+            &mut self.status_bg,
+            &mut self.status_fg,
+            &mut self.tab_active_bg,
+            &mut self.tab_active_fg,
+            &mut self.tab_inactive_fg,
+            &mut self.modal_bg,
+            &mut self.modal_border,
+            &mut self.title,
+            &mut self.badge,
+            &mut self.sparkline,
+            &mut self.minimap_bg,
+            &mut self.minimap_view,
+            &mut self.scrollbar,
+            &mut self.input_bg,
+            &mut self.muted_bg,
+            &mut self.warning,
+            &mut self.success,
+        ] {
+            f(c);
+        }
+        for c in self.levels.iter_mut().chain(self.sources.iter_mut()) {
+            f(c);
+        }
+        if depth == Depth::Mono {
+            // Backgrounds collapse to the terminal default; keep emphasis via
+            // modifiers only (see `Theme::style_*`).
+            self.bg = Color::Reset;
+            self.fg = Color::Reset;
+            self.status_bg = Color::Reset;
+            self.modal_bg = Color::Reset;
+            self.minimap_bg = Color::Reset;
+            self.input_bg = Color::Reset;
+            self.muted_bg = Color::Reset;
+            self.chip_bg = Color::Reset;
+            self.tab_active_bg = Color::Reset;
+        }
+        self
+    }
+
     pub fn is_mono(&self) -> bool {
         self.depth == Depth::Mono
     }
@@ -325,6 +393,22 @@ impl Theme {
         self.levels[level.index()]
     }
 
+    pub fn tab(&self, active: bool) -> Style {
+        if self.is_mono() {
+            if active {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            }
+        } else if active {
+            Style::default()
+                .fg(self.tab_active_fg)
+                .bg(self.tab_active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.tab_inactive_fg)
+        }
+    }
 }
 
 /// Parse `#rrggbb`, `rgb(r,g,b)`, an ANSI name, or a 0-255 index.
@@ -490,6 +574,33 @@ mod tests {
         assert_eq!(parse_color("red"), Some(Color::Red));
         assert_eq!(parse_color("42"), Some(Color::Indexed(42)));
         assert_eq!(parse_color("nope"), None);
+    }
+
+    #[test]
+    fn degrades() {
+        assert_eq!(
+            adapt_color(Color::Rgb(255, 0, 0), Depth::Ansi16),
+            Color::Red
+        );
+        assert_eq!(
+            adapt_color(Color::Rgb(255, 120, 120), Depth::Ansi16),
+            Color::LightRed
+        );
+        assert_eq!(
+            adapt_color(Color::Rgb(0, 0, 0), Depth::Ansi256),
+            Color::Indexed(16)
+        );
+        assert_eq!(
+            adapt_color(Color::Rgb(255, 255, 255), Depth::Ansi256),
+            Color::Indexed(231)
+        );
+        assert_eq!(
+            adapt_color(Color::Rgb(10, 20, 30), Depth::Mono),
+            Color::Reset
+        );
+        let t = Theme::dark().adapt(Depth::Mono);
+        assert!(t.is_mono());
+        assert_eq!(t.base(), Style::default());
     }
 
     #[test]

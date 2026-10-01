@@ -2,6 +2,29 @@
 
 use unicode_width::UnicodeWidthStr;
 
+/// Truncate `s` to `width` columns, appending `…` (or `~` in ASCII mode).
+pub fn fit(s: &str, width: usize, ascii: bool) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let ell = if ascii { "~" } else { "…" };
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw + 1 > width {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str(ell);
+    out
+}
+
 /// Human-readable byte size.
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
