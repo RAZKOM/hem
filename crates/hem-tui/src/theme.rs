@@ -436,6 +436,53 @@ impl Theme {
         }
     }
 
+    pub fn match_style(&self, current: bool) -> Style {
+        if self.is_mono() {
+            return Style::default().add_modifier(if current {
+                Modifier::REVERSED | Modifier::BOLD
+            } else {
+                Modifier::UNDERLINED
+            });
+        }
+        if current {
+            Style::default().fg(Color::Black).bg(self.current_match_bg)
+        } else {
+            Style::default().fg(self.match_fg).bg(self.match_bg)
+        }
+    }
+
+    pub fn highlight(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().bg(self.highlight_bg)
+        }
+    }
+
+    pub fn status(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(self.status_fg).bg(self.status_bg)
+        }
+    }
+
+    pub fn chip(&self) -> Style {
+        if self.is_mono() {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(self.chip_fg).bg(self.chip_bg)
+        }
+    }
+
+    pub fn modal(&self) -> Style {
+        if self.is_mono() {
+            Style::default()
+        } else {
+            Style::default().fg(self.fg).bg(self.modal_bg)
+        }
+    }
+
     pub fn accent_style(&self) -> Style {
         if self.is_mono() {
             Style::default().add_modifier(Modifier::BOLD)

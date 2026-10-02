@@ -49,6 +49,46 @@ hem templates app.log               # most common line templates, as a table
 
 Inside the TUI press `?` for help, `:` for the command palette.
 
+## Keys
+
+The defaults (all configurable, see [Configuration](#configuration)):
+
+| Key | Action |
+|---|---|
+| `j`/`k`, `↑`/`↓`, wheel | scroll |
+| `g` / `G` | top / bottom |
+| `PgUp`/`PgDn`, `Ctrl+u`/`Ctrl+d` | page / half page |
+| `h` / `←` / `→` | scroll sideways (when not wrapping) |
+| `f` | toggle follow (auto-enabled when you hit the bottom of a growing file) |
+| `/` | search (regex, smart case) · `n` / `N` next / previous match · `Ctrl+l` clear |
+| `&` | filter: show only lines matching a regex |
+| `!` | exclude lines matching a regex |
+| `=` | field filter (`status>=500`, `user=bob`, `msg~time.?out`, `trace_id?`) |
+| `F` | filter editor (include / exclude / fields / level / time range) |
+| `X` | clear all filters |
+| `l` | cycle minimum level |
+| `e` / `E` | next / previous error |
+| `c` | toggle repeat collapsing |
+| `x` | expand / collapse a repeated run inline |
+| `t` | templates view (`s` sort column, `r` reverse, `/` filter, `Enter` show occurrences) |
+| `Enter` | line detail (pretty JSON, fields, context; `Tab` picks a field, `*` highlights its value) |
+| `p` | pin / unpin line |
+| `*` | highlight all lines containing a value (request id, thread, trace id…) |
+| `y` / `Y` | copy line / copy visible lines (system clipboard, OSC 52 over SSH) |
+| `w` | toggle wrap |
+| `C` | toggle field columns (JSON / logfmt) |
+| `T` | cycle timestamp display (original, time, iso, local, relative) |
+| `Tab` / `Shift+Tab` | switch source tabs · `S` source picker · `o` open a file |
+| `L` | go to line / percentage / time (`1234`, `50%`, `10:30`, `2026-10-13T10:30:00Z`, `15m`) |
+| `:` or `Ctrl+p` | command palette |
+| `,` | settings |
+| `?` | help (generated from the live keymap) |
+| `q` / `Esc` | close modal / leave templates view / quit |
+
+Everything is clickable too: tabs, filter chips (click ✕ to remove one),
+rows (click to select, click again for detail), the minimap (click or drag
+to jump), the scrollbar, modal items and buttons.
+
 ## Filters
 
 Filters compose: every include pattern must match, no exclude pattern may

@@ -146,6 +146,13 @@ impl Histogram {
         out
     }
 
+    /// Display cell for a key.
+    pub fn cell_of(&self, key: i64, n: usize) -> usize {
+        let used = self.used.max(1);
+        let b = self.bucket_of(key).min(used - 1);
+        (b * n / used).min(n.saturating_sub(1))
+    }
+
     /// First bucket at or after `from` whose counts at level `>= min` are
     /// non-zero.  `forward=false` searches backwards.
     pub fn next_bucket_with(&self, from: usize, min: Level, forward: bool) -> Option<usize> {

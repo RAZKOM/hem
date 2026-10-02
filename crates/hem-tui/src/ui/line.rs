@@ -234,6 +234,15 @@ fn is_key_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'@')
 }
 
+/// Byte ranges of regex matches within a line (capped).
+pub fn match_ranges(re: &regex::bytes::Regex, line: &[u8]) -> Vec<(usize, usize)> {
+    re.find_iter(&line[..line.len().min(MAX_SEGMENT_BYTES)])
+        .take(64)
+        .map(|m| (m.start(), m.end()))
+        .filter(|(s, e)| e > s)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,8 @@
 
 pub mod bars;
 pub mod line;
+pub mod logpane;
+pub mod minimap;
 pub mod templates;
 pub mod widgets;
 

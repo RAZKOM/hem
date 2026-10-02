@@ -33,6 +33,10 @@ impl Input {
         self.cursor += 1;
     }
 
+    pub fn end(&mut self) {
+        self.cursor = self.len();
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -50,6 +54,32 @@ pub enum PromptKind {
     OpenFile,
     Highlight,
     Goto,
+}
+
+impl PromptKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PromptKind::Search => "/",
+            PromptKind::Include => "& filter",
+            PromptKind::Exclude => "! exclude",
+            PromptKind::Field => "= field",
+            PromptKind::OpenFile => "open",
+            PromptKind::Highlight => "* highlight",
+            PromptKind::Goto => "go to",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            PromptKind::Search => "regex (smart case) · Enter: search · Esc: cancel",
+            PromptKind::Include => "show only lines matching this regex",
+            PromptKind::Exclude => "hide lines matching this regex",
+            PromptKind::Field => "key=value · key!=value · key~regex · status>=500 · key?",
+            PromptKind::OpenFile => "path to a log file (.gz ok)",
+            PromptKind::Highlight => "value to highlight (request id, thread, trace id…)",
+            PromptKind::Goto => "line number · 50% · timestamp (10:30, 2026-10-13T10:30:00Z, 5m)",
+        }
+    }
 }
 
 /// Filter editor fields.
@@ -86,6 +116,36 @@ impl FilterEditorState {
             (i + n - 1) % n
         };
         self.level = order[j];
+    }
+}
+
+/// Settings rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingItem {
+    Theme,
+    Collapse,
+    Timestamp,
+    Wrap,
+    Follow,
+    Columns,
+    Minimap,
+    Mouse,
+    Ascii,
+}
+
+impl SettingItem {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingItem::Theme => "Theme",
+            SettingItem::Collapse => "Collapse repeated lines",
+            SettingItem::Timestamp => "Timestamp display",
+            SettingItem::Wrap => "Wrap long lines",
+            SettingItem::Follow => "Follow by default",
+            SettingItem::Columns => "Field columns (JSON/logfmt)",
+            SettingItem::Minimap => "Timeline minimap",
+            SettingItem::Mouse => "Mouse support",
+            SettingItem::Ascii => "ASCII box drawing",
+        }
     }
 }
 
@@ -190,6 +250,19 @@ impl Modal {
             Modal::Prompt { .. } | Modal::Palette { .. } => true,
             Modal::FilterEditor(s) => matches!(s.focus, 0 | 1 | 2 | 4 | 5),
             _ => false,
+        }
+    }
+
+    pub fn title(&self) -> String {
+        match self {
+            Modal::Prompt { kind, .. } => kind.label().to_string(),
+            Modal::Palette { .. } => "Command palette".into(),
+            Modal::FilterEditor(_) => "Filter editor".into(),
+            Modal::Settings { .. } => "Settings".into(),
+            Modal::Help { .. } => "Help".into(),
+            Modal::Sources { .. } => "Sources".into(),
+            Modal::Detail { .. } => "Line detail".into(),
+            Modal::Message { title, .. } => title.clone(),
         }
     }
 }

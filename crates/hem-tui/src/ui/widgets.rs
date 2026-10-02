@@ -1,5 +1,6 @@
 //! Small drawing helpers shared by the views.
 
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 /// Truncate `s` to `width` columns, appending `…` (or `~` in ASCII mode).
@@ -36,6 +37,71 @@ pub fn pad(s: &str, width: usize, ascii: bool) -> String {
     }
 }
 
+/// Split a styled line into display lines of at most `width` columns.
+pub fn wrap_spans<'a>(spans: Vec<Span<'a>>, width: usize) -> Vec<Line<'a>> {
+    if width == 0 {
+        return vec![Line::from(spans)];
+    }
+    let mut lines = Vec::new();
+    let mut cur: Vec<Span<'a>> = Vec::new();
+    let mut cur_w = 0usize;
+    for span in spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for c in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if cur_w + cw > width {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                lines.push(Line::from(std::mem::take(&mut cur)));
+                cur_w = 0;
+            }
+            buf.push(c);
+            cur_w += cw;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    lines
+}
+
+/// Skip `skip` columns then keep at most `width` columns of a span list.
+pub fn clip_spans<'a>(spans: Vec<Span<'a>>, skip: usize, width: usize) -> Vec<Span<'a>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let end = skip + width;
+    for span in spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for c in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            let (s, e) = (pos, pos + cw);
+            pos = e;
+            if e <= skip || s >= end {
+                continue;
+            }
+            if s < skip || e > end {
+                // Partially visible wide char: replace with a space.
+                buf.push(' ');
+            } else {
+                buf.push(c);
+            }
+        }
+        if !buf.is_empty() {
+            out.push(Span::styled(buf, style));
+        }
+        if pos >= end {
+            break;
+        }
+    }
+    out
+}
+
 /// Format a number with thousands separators.
 pub fn group(n: u64) -> String {
     let s = n.to_string();
@@ -62,5 +128,26 @@ pub fn bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helpers() {
+        assert_eq!(group(1234567), "1,234,567");
+        assert_eq!(group(12), "12");
+        assert_eq!(bytes(2_470_000_000), "2.3 GB");
+        assert_eq!(fit("hello world", 5, false), "hell…");
+        assert_eq!(fit("hi", 5, false), "hi");
+        assert_eq!(pad("hi", 4, true), "hi  ");
+        let spans = vec![Span::raw("abcdef"), Span::raw("ghij")];
+        let lines = wrap_spans(spans.clone(), 4);
+        assert_eq!(lines.len(), 3);
+        let clipped = clip_spans(spans, 2, 5);
+        let text: String = clipped.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "cdefg");
     }
 }

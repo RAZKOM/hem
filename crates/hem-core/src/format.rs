@@ -30,6 +30,14 @@ impl Format {
         }
     }
 
+    /// Whether this format exposes structured fields.
+    pub fn has_fields(self) -> bool {
+        matches!(
+            self,
+            Format::Json | Format::Logfmt | Format::Nginx | Format::Syslog
+        )
+    }
+
     /// Guess the format from a sample of lines.  Requires a clear majority
     /// so that a few JSON lines inside a plain log do not flip the whole
     /// source.
