@@ -1,7 +1,68 @@
 //! Small drawing helpers shared by the views.
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders};
 use unicode_width::UnicodeWidthStr;
+
+use crate::theme::Theme;
+
+/// A rectangle of `w`×`h` centred in `area` (clamped).
+pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Dim everything in `area` (used under modals).
+pub fn dim(buf: &mut Buffer, area: Rect, theme: &Theme) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if !theme.is_mono() {
+                    cell.set_fg(theme.dim);
+                }
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
+}
+
+/// Border glyphs honouring `--ascii`.
+pub fn border_set(ascii: bool) -> border::Set<'static> {
+    if ascii {
+        border::Set {
+            top_left: "+",
+            top_right: "+",
+            bottom_left: "+",
+            bottom_right: "+",
+            vertical_left: "|",
+            vertical_right: "|",
+            horizontal_top: "-",
+            horizontal_bottom: "-",
+        }
+    } else {
+        border::ROUNDED
+    }
+}
+
+/// A bordered block with a title.
+pub fn block<'a>(title: &'a str, theme: &Theme, ascii: bool) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_set(border_set(ascii))
+        .border_style(Style::default().fg(theme.modal_border))
+        .title(Span::styled(format!(" {title} "), theme.title_style()))
+        .style(theme.modal())
+}
 
 /// Truncate `s` to `width` columns, appending `…` (or `~` in ASCII mode).
 pub fn fit(s: &str, width: usize, ascii: bool) -> String {
