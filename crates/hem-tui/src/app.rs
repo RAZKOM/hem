@@ -11,9 +11,11 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 
 use hem_core::cluster::{Clusters, Template};
+use hem_core::collapse::shape_hash;
 use hem_core::filter::{Filter, Matcher};
+use hem_core::format::Format;
 use hem_core::merge::Merged;
-use hem_core::parse::MetaCache;
+use hem_core::parse::{parse_line, LineMeta, MetaCache};
 use hem_core::search::Search;
 use hem_core::source::Notice as SourceNotice;
 use hem_core::timestamp::TsDisplay;
@@ -26,6 +28,9 @@ use crate::keymap::{Action, KeyMap};
 use crate::modal::{Modal, TemplateSort, TemplatesState};
 use crate::theme::{Depth, Theme};
 use crate::RunOptions;
+
+/// Maximum lines expanded inline for a collapsed run.
+pub const MAX_EXPAND: usize = 500;
 
 /// Something clickable, recorded during render.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +164,122 @@ impl Tab {
         self.view.is_empty()
     }
 
+    pub fn format_for(&self, source: u8) -> Format {
+        self.view.format_for(source)
+    }
+
+    pub fn is_pinned(&self, row: Row) -> bool {
+        self.pins.contains(&(row.source(), row.line()))
+    }
+
+    pub fn line_bytes(&self, row: Row) -> Vec<u8> {
+        self.base.line_bytes(row).unwrap_or_default()
+    }
+
+    pub fn meta_for(&self, row: Row, line: &[u8]) -> LineMeta {
+        let gen = self.view.generation();
+        let key = ((row.source() as u64) << 48) | row.line();
+        self.meta.get_or_parse(
+            gen,
+            key,
+            line,
+            self.format_for(row.source()),
+            self.view.default_year(),
+        )
+    }
+
+    /// Member lines of a collapsed run (bounded).
+    pub fn members(&mut self, row_idx: usize) -> Vec<Row> {
+        if let Some(m) = self.member_cache.get(&row_idx) {
+            return m.clone();
+        }
+        let Some(row) = self.view.row(row_idx) else {
+            return Vec::new();
+        };
+        let want = row.count() as usize;
+        let mut out = vec![row.with_count(1)];
+        if want <= 1 {
+            return out;
+        }
+        if let Some(src) = self.base.source(row.source()) {
+            let g = src.read();
+            let fmt = self.format_for(row.source());
+            let year = self.view.default_year();
+            let rep = g.line(row.line() as usize).unwrap_or(&[]).to_vec();
+            let key = shape_hash(&rep);
+            let mut l = row.line() as usize + 1;
+            let mut scanned = 0usize;
+            let n = g.line_count();
+            while out.len() < want.min(MAX_EXPAND) && l < n && scanned < 200_000 {
+                if let Some(line) = g.line(l) {
+                    let meta = parse_line(line, fmt, year);
+                    if self.filter.matches(line, &meta, fmt) {
+                        if shape_hash(line) == key {
+                            out.push(Row::new(l as u64, row.source(), 1));
+                        } else if !self.base.is_merged() {
+                            // Consecutive (in filtered order) means the run ended.
+                            break;
+                        }
+                    }
+                }
+                l += 1;
+                scanned += 1;
+            }
+        }
+        if self.member_cache.len() > 256 {
+            self.member_cache.clear();
+        }
+        self.member_cache.insert(row_idx, out.clone());
+        out
+    }
+
+    /// Sparkline heights (0..=8) for a collapsed run: where in time (or
+    /// position) its repeats occurred.
+    pub fn sparkline(&mut self, row_idx: usize, cells: usize) -> Vec<u8> {
+        let members = self.members(row_idx);
+        if members.len() < 2 || cells == 0 {
+            return Vec::new();
+        }
+        let fmt = self.format_for(members[0].source());
+        let year = self.view.default_year();
+        let mut keys: Vec<i64> = Vec::with_capacity(members.len());
+        let mut carry = None;
+        if let Some(src) = self.base.source(members[0].source()) {
+            let g = src.read();
+            for m in &members {
+                let line = g.line(m.line() as usize).unwrap_or(&[]);
+                let meta = parse_line(line, fmt, year);
+                if meta.ts.is_some() {
+                    carry = meta.ts;
+                }
+                keys.push(carry.unwrap_or(m.line() as i64));
+            }
+        }
+        let (min, max) = (
+            keys.iter().copied().min().unwrap_or(0),
+            keys.iter().copied().max().unwrap_or(0),
+        );
+        let mut buckets = vec![0u32; cells];
+        for k in &keys {
+            let i = if max > min {
+                (((k - min) as u128 * cells as u128) / (max - min + 1) as u128) as usize
+            } else {
+                0
+            };
+            buckets[i.min(cells - 1)] += 1;
+        }
+        let peak = buckets.iter().copied().max().unwrap_or(1).max(1);
+        buckets
+            .iter()
+            .map(|b| {
+                if *b == 0 {
+                    0
+                } else {
+                    (1 + (*b as u64 * 7) / peak as u64) as u8
+                }
+            })
+            .collect()
+    }
 }
 
 /// Top-level application state.
@@ -300,6 +421,11 @@ impl App {
 
     pub fn tab(&self) -> &Tab {
         &self.tabs[self.active.min(self.tabs.len() - 1)]
+    }
+
+    pub fn tab_mut(&mut self) -> &mut Tab {
+        let i = self.active.min(self.tabs.len() - 1);
+        &mut self.tabs[i]
     }
 
     pub fn take_dirty(&mut self) -> bool {
