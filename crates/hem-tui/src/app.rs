@@ -330,6 +330,21 @@ pub enum PaletteItem {
     Tab(usize),
 }
 
+impl PaletteItem {
+    pub fn label(&self, app: &App) -> String {
+        match self {
+            PaletteItem::Action(a) => a.label().to_string(),
+            PaletteItem::Preset(p) => format!("Preset: {p}"),
+            PaletteItem::Theme(t) => format!("Theme: {t}"),
+            PaletteItem::MergeAll => "Merge all sources by timestamp".into(),
+            PaletteItem::Tab(i) => format!(
+                "Switch to: {}",
+                app.tabs.get(*i).map(|t| t.name.as_str()).unwrap_or("?")
+            ),
+        }
+    }
+}
+
 impl App {
     pub fn new(opts: RunOptions) -> Result<App> {
         let depth = Depth::detect();
@@ -436,8 +451,26 @@ impl App {
         self.dirty.store(true, Ordering::Release);
     }
 
+    pub fn take_osc52(&mut self) -> Option<String> {
+        self.osc52.take()
+    }
+
     pub fn animating(&self) -> bool {
         false
+    }
+
+    /// Any background work still running?
+    pub fn busy(&self) -> bool {
+        let t = self.tab();
+        let src_busy = t.base.sources().iter().any(|s| !s.is_complete());
+        src_busy
+            || !t.view.is_complete()
+            || t.search.as_ref().map(|s| !s.is_complete()).unwrap_or(false)
+            || t.clusters
+                .as_ref()
+                .map(|c| !c.is_complete())
+                .unwrap_or(false)
+            || t.pending_anchor.is_some()
     }
 
     pub fn log_debug(&mut self, msg: &str) {
@@ -602,6 +635,18 @@ impl App {
 
     // --- Modals ---------------------------------------------------------------
 
+    /// Palette entries matching the query, best first.
+    pub fn palette_matches(&self, query: &str) -> Vec<(usize, i32)> {
+        let mut v: Vec<(usize, i32)> = self
+            .palette_items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| fuzzy_score(query, &item.label(self)).map(|s| (i, s)))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
     /// Templates sorted for display.
     pub fn sorted_templates(&self) -> Vec<Template> {
         let t = self.tab();
@@ -677,6 +722,44 @@ impl App {
 
 }
 
+/// Simple subsequence fuzzy score: higher is better, `None` if no match.
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let q: Vec<char> = query
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut qi = 0;
+    let mut last: Option<usize> = None;
+    for (i, c) in t.iter().enumerate() {
+        if qi < q.len() && *c == q[qi] {
+            score += 10;
+            if let Some(l) = last {
+                if l + 1 == i {
+                    score += 15;
+                }
+            }
+            if i == 0 || !t[i - 1].is_alphanumeric() {
+                score += 8;
+            }
+            last = Some(i);
+            qi += 1;
+        }
+    }
+    if qi < q.len() {
+        return None;
+    }
+    if let Some(pos) = text.to_lowercase().find(&query.to_lowercase()) {
+        score += 40 - (pos as i32).min(30);
+    }
+    Some(score - t.len() as i32 / 8)
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -684,5 +767,20 @@ pub fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy() {
+        assert!(
+            fuzzy_score("ne", "Next error").unwrap()
+                > fuzzy_score("ne", "Toggle line wrap").unwrap_or(-999)
+        );
+        assert_eq!(fuzzy_score("zzz", "Next error"), None);
+        assert!(fuzzy_score("", "anything").is_some());
     }
 }

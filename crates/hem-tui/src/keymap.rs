@@ -72,6 +72,19 @@ pub enum Category {
     App,
 }
 
+impl Category {
+    pub fn title(self) -> &'static str {
+        match self {
+            Category::Navigation => "Navigation",
+            Category::Search => "Search",
+            Category::Filters => "Filters",
+            Category::Insight => "Insight",
+            Category::View => "View",
+            Category::App => "Application",
+        }
+    }
+}
+
 impl Action {
     pub const ALL: [Action; 48] = [
         Action::ScrollUp,
