@@ -88,6 +88,10 @@ impl Search {
         }
     }
 
+    pub fn cancel(&self) {
+        self.0.cancel.store(true, Ordering::Release);
+    }
+
     pub fn add_waker(&self, w: Arc<dyn Fn() + Send + Sync>) {
         self.0.wakers.lock().push(w);
     }

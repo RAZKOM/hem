@@ -327,6 +327,14 @@ impl Filter {
         Ok(f)
     }
 
+    /// Rebuild the spec from the compiled parts (after programmatic edits).
+    pub fn sync_spec(&mut self) {
+        self.spec.include = self.include.iter().map(|m| m.text.clone()).collect();
+        self.spec.exclude = self.exclude.iter().map(|m| m.text.clone()).collect();
+        self.spec.level = self.min_level;
+        self.spec.fields = self.fields.iter().map(|p| p.display()).collect();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.include.is_empty()
             && self.exclude.is_empty()

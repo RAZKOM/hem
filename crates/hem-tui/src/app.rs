@@ -8,24 +8,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 
 use hem_core::cluster::{Clusters, Template};
 use hem_core::collapse::shape_hash;
-use hem_core::filter::{Filter, Matcher};
+use hem_core::filter::{FieldPredicate, Filter, Matcher, TemplateMatch};
 use hem_core::format::Format;
 use hem_core::merge::Merged;
 use hem_core::parse::{parse_line, LineMeta, MetaCache};
 use hem_core::search::Search;
-use hem_core::source::Notice as SourceNotice;
-use hem_core::timestamp::TsDisplay;
+use hem_core::source::{Notice as SourceNotice, SourceOptions};
+use hem_core::timestamp::{self, TsDisplay};
 use hem_core::view::{Base, Row, View, ViewSpec};
 use hem_core::{Level, Source};
 
 use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::keymap::{Action, KeyMap};
-use crate::modal::{Modal, TemplateSort, TemplatesState};
+use crate::modal::{Input, Modal, PromptKind, TemplateSort, TemplatesState};
 use crate::theme::{Depth, Theme};
 use crate::RunOptions;
 
@@ -481,6 +482,10 @@ impl App {
 
     // --- Notices ---------------------------------------------------------
 
+    pub fn notice(&mut self, text: impl Into<String>) {
+        self.push_notice(text.into(), false);
+    }
+
     pub fn notice_warn(&mut self, text: impl Into<String>) {
         self.push_notice(text.into(), true);
     }
@@ -627,11 +632,215 @@ impl App {
         self.tabs.push(tab);
     }
 
+    pub fn open_path(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let opts = SourceOptions {
+            follow: true,
+            ..Default::default()
+        };
+        match Source::open(path, opts) {
+            Ok(src) => {
+                src.add_waker(Arc::clone(&self.wake));
+                let t = self.tab();
+                let (filter, collapse, follow, wrap, columns) =
+                    (t.filter.clone(), t.collapse, t.follow, t.wrap, t.columns);
+                let tab = Tab::new(
+                    src.name().to_string(),
+                    Base::Single(src),
+                    filter,
+                    collapse,
+                    follow,
+                    wrap,
+                    columns,
+                );
+                tab.view.add_waker(Arc::clone(&self.wake));
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                self.notice(format!("opened {path}"));
+            }
+            Err(e) => self.notice_warn(e.to_string()),
+        }
+    }
+
     // --- View rebuilding ---------------------------------------------------
+
+    /// Rebuild the active tab's view after a filter / collapse change.
+    pub fn rebuild_view(&mut self) {
+        let wake = Arc::clone(&self.wake);
+        let t = self.tab_mut();
+        let anchor = t.view.row(t.cursor).map(|r| (r.source(), r.line()));
+        t.view.cancel();
+        if let Some(s) = t.search.take() {
+            s.cancel();
+        }
+        t.view = View::start(
+            t.base.clone(),
+            ViewSpec {
+                filter: t.filter.clone(),
+                collapse: t.collapse,
+            },
+        );
+        t.view.add_waker(wake);
+        t.view_gen = t.view.generation();
+        t.expanded.clear();
+        t.member_cache.clear();
+        t.current_match = None;
+        t.last_len = 0;
+        t.pending_anchor = anchor;
+        if !t.search_text.is_empty() {
+            let pat = t.search_text.clone();
+            self.start_search(&pat);
+        }
+        self.mark_dirty();
+    }
+
+    pub fn start_search(&mut self, pattern: &str) {
+        let wake = Arc::clone(&self.wake);
+        let t = self.tab_mut();
+        if let Some(s) = t.search.take() {
+            s.cancel();
+        }
+        t.current_match = None;
+        if pattern.is_empty() {
+            t.search_text.clear();
+            return;
+        }
+        match Matcher::new(pattern, false) {
+            Ok(m) => {
+                t.search_text = pattern.to_string();
+                let s = Search::start(t.view.clone(), m);
+                s.add_waker(wake);
+                t.search = Some(s);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.notice_warn(msg);
+            }
+        }
+    }
 
     // --- Scrolling ------------------------------------------------------
 
+    fn page_size(&self) -> usize {
+        self.tab().last_height.max(1)
+    }
+
+    pub fn set_cursor(&mut self, row: usize) {
+        let h = self.page_size();
+        let t = self.tab_mut();
+        let n = t.len();
+        if n == 0 {
+            t.cursor = 0;
+            t.top = 0;
+            return;
+        }
+        t.cursor = row.min(n - 1);
+        if t.cursor < t.top {
+            t.top = t.cursor;
+        } else if t.cursor >= t.top + h {
+            t.top = t.cursor + 1 - h;
+        }
+    }
+
+    pub fn scroll_by(&mut self, delta: isize) {
+        let n = self.tab().len();
+        let cur = self.tab().cursor as isize;
+        let target = (cur + delta).clamp(0, n.saturating_sub(1) as isize) as usize;
+        let live = self.tab().base.is_live();
+        self.set_cursor(target);
+        let t = self.tab_mut();
+        if delta < 0 {
+            t.follow = false;
+        } else if live && t.cursor + 1 >= n && n > 0 && delta > 0 {
+            t.follow = true;
+        }
+    }
+
+    pub fn center_on(&mut self, row: usize) {
+        let h = self.page_size();
+        let t = self.tab_mut();
+        let n = t.len();
+        if n == 0 {
+            return;
+        }
+        t.cursor = row.min(n - 1);
+        t.top = t.cursor.saturating_sub(h / 2);
+        t.follow = false;
+    }
+
+    pub fn go_bottom(&mut self) {
+        let n = self.tab().len();
+        let live = self.tab().base.is_live();
+        self.set_cursor(n.saturating_sub(1));
+        if live {
+            self.tab_mut().follow = true;
+        }
+    }
+
     // --- Actions -----------------------------------------------------------
+
+    fn jump_match(&mut self, forward: bool) {
+        let t = self.tab();
+        let Some(s) = &t.search else {
+            self.notice("no search · press / to search");
+            return;
+        };
+        let cur = t.cursor;
+        let found = if forward {
+            s.next_after(cur)
+        } else {
+            s.prev_before(cur)
+        };
+        let total = s.count();
+        match found {
+            Some((i, row)) => {
+                self.center_on(row);
+                self.tab_mut().current_match = Some(i);
+                self.notice(format!("match {}/{total}", i + 1));
+            }
+            None => self.notice("no matches"),
+        }
+    }
+
+    fn jump_error(&mut self, forward: bool) {
+        let t = self.tab();
+        let from = if forward {
+            t.cursor + 1
+        } else {
+            t.cursor.saturating_sub(1)
+        };
+        if (forward && from >= t.len()) || (!forward && t.cursor == 0) {
+            self.notice("no more errors");
+            return;
+        }
+        match t.view.find_level(from, Level::Error, forward) {
+            Some(row) => self.center_on(row),
+            None => self.notice(if forward {
+                "no more errors"
+            } else {
+                "no earlier errors"
+            }),
+        }
+    }
+
+    pub fn jump_to_line(&mut self, line: u64) {
+        let row = self.tab().view.row_for_line(0, line.saturating_sub(1));
+        self.center_on(row);
+    }
+
+    pub fn jump_to_fraction(&mut self, pct: f64) {
+        let n = self.tab().len();
+        let row = ((n as f64) * pct.clamp(0.0, 1.0)) as usize;
+        self.center_on(row.min(n.saturating_sub(1)));
+    }
+
+    pub fn jump_to_timestamp(&mut self, ts: i64) {
+        let row = self.tab().view.row_for_timestamp(ts);
+        self.center_on(row);
+    }
 
     // --- Modals ---------------------------------------------------------------
 
@@ -645,6 +854,35 @@ impl App {
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
+    }
+
+    fn open_detail(&mut self) {
+        let t = self.tab();
+        let Some(row) = t.view.row(t.cursor) else {
+            return;
+        };
+        self.modal = Some(Modal::Detail {
+            row_idx: t.cursor,
+            row,
+            scroll: 0,
+            selected_field: 0,
+        });
+    }
+
+    fn toggle_templates(&mut self) {
+        if self.templates_mode {
+            self.templates_mode = false;
+            return;
+        }
+        let wake = Arc::clone(&self.wake);
+        let cap = self.cluster_cap;
+        let t = self.tab_mut();
+        if t.clusters.is_none() {
+            let c = Clusters::start(t.base.clone(), cap);
+            c.add_waker(wake);
+            t.clusters = Some(c);
+        }
+        self.templates_mode = true;
     }
 
     /// Templates sorted for display.
@@ -674,6 +912,21 @@ impl App {
             }
         });
         v
+    }
+
+    fn apply_selected_template(&mut self) {
+        let list = self.sorted_templates();
+        let sel = self.tab().templates.selected;
+        let Some(tpl) = list.get(sel) else { return };
+        let m: TemplateMatch = tpl.matcher();
+        let label = m.display();
+        let first = tpl.first;
+        let t = self.tab_mut();
+        t.filter.template = Some(m);
+        self.rebuild_view();
+        self.templates_mode = false;
+        self.tab_mut().pending_anchor = Some((first.source(), first.line()));
+        self.notice(format!("template: {}", truncate(&label, 60)));
     }
 
     // --- Chips -------------------------------------------------------------
@@ -718,8 +971,108 @@ impl App {
 
     // --- Input ---------------------------------------------------------------
 
+    fn submit_prompt(&mut self, kind: PromptKind, text: &str) {
+        let text = text.trim();
+        match kind {
+            PromptKind::Search => {
+                self.start_search(text);
+                if !text.is_empty() {
+                    // Jump to the first match once results arrive: try now.
+                    self.jump_match(true);
+                }
+            }
+            PromptKind::Include | PromptKind::Exclude => {
+                if text.is_empty() {
+                    return;
+                }
+                match Matcher::new(text, false) {
+                    Ok(m) => {
+                        let t = self.tab_mut();
+                        if kind == PromptKind::Include {
+                            t.filter.include.push(m);
+                        } else {
+                            t.filter.exclude.push(m);
+                        }
+                        t.filter.sync_spec();
+                        self.rebuild_view();
+                    }
+                    Err(e) => self.notice_warn(e.to_string()),
+                }
+            }
+            PromptKind::Field => {
+                if text.is_empty() {
+                    return;
+                }
+                match FieldPredicate::parse(text) {
+                    Ok(p) => {
+                        let t = self.tab_mut();
+                        t.filter.fields.push(p);
+                        t.filter.sync_spec();
+                        self.rebuild_view();
+                    }
+                    Err(e) => self.notice_warn(e.to_string()),
+                }
+            }
+            PromptKind::OpenFile => self.open_path(text),
+            PromptKind::Highlight => {
+                if text.is_empty() {
+                    self.tab_mut().highlight = None;
+                } else {
+                    match Matcher::new(text, true) {
+                        Ok(m) => self.tab_mut().highlight = Some(m),
+                        Err(e) => self.notice_warn(e.to_string()),
+                    }
+                }
+            }
+            PromptKind::Goto => self.goto(text),
+        }
+    }
+
+    pub fn goto(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(p) = text.strip_suffix('%') {
+            if let Ok(v) = p.trim().parse::<f64>() {
+                self.jump_to_fraction(v / 100.0);
+                return;
+            }
+        }
+        if let Ok(n) = text.parse::<u64>() {
+            self.jump_to_line(n);
+            return;
+        }
+        if let Some(ts) = timestamp::parse_user(text) {
+            self.jump_to_timestamp(ts);
+            return;
+        }
+        self.notice_warn(format!(
+            "cannot interpret {text:?} as a line, percentage or time"
+        ));
+    }
+
     // --- Mouse -----------------------------------------------------------------
 
+}
+
+/// Apply a key event to a text input (shared by prompts and editors).
+pub fn edit_input(input: &mut Input, ev: &KeyEvent) {
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    match ev.code {
+        KeyCode::Char('u') if ctrl => input.kill_to_start(),
+        KeyCode::Char('w') if ctrl => input.delete_word(),
+        KeyCode::Char('a') if ctrl => input.home(),
+        KeyCode::Char('e') if ctrl => input.end(),
+        KeyCode::Char(c) if !ctrl => input.insert(c),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete(),
+        KeyCode::Left => input.left(),
+        KeyCode::Right => input.right(),
+        KeyCode::Home => input.home(),
+        KeyCode::End => input.end(),
+        _ => {}
+    }
 }
 
 /// Simple subsequence fuzzy score: higher is better, `None` if no match.
