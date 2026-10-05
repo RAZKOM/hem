@@ -33,6 +33,35 @@ impl Input {
         self.cursor += 1;
     }
 
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let b = self.byte_at(self.cursor - 1);
+        self.text.remove(b);
+        self.cursor -= 1;
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor >= self.len() {
+            return;
+        }
+        let b = self.byte_at(self.cursor);
+        self.text.remove(b);
+    }
+
+    pub fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.len());
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
     pub fn end(&mut self) {
         self.cursor = self.len();
     }
@@ -42,6 +71,22 @@ impl Input {
         self.cursor = 0;
     }
 
+    /// Delete the word before the cursor (Ctrl+W).
+    pub fn delete_word(&mut self) {
+        while self.cursor > 0 && self.text.chars().nth(self.cursor - 1) == Some(' ') {
+            self.backspace();
+        }
+        while self.cursor > 0 && self.text.chars().nth(self.cursor - 1) != Some(' ') {
+            self.backspace();
+        }
+    }
+
+    /// Delete everything before the cursor (Ctrl+U).
+    pub fn kill_to_start(&mut self) {
+        let b = self.byte_at(self.cursor);
+        self.text.drain(..b);
+        self.cursor = 0;
+    }
 }
 
 /// What an inline prompt is for.
@@ -134,6 +179,18 @@ pub enum SettingItem {
 }
 
 impl SettingItem {
+    pub const ALL: [SettingItem; 9] = [
+        SettingItem::Theme,
+        SettingItem::Collapse,
+        SettingItem::Timestamp,
+        SettingItem::Wrap,
+        SettingItem::Follow,
+        SettingItem::Columns,
+        SettingItem::Minimap,
+        SettingItem::Mouse,
+        SettingItem::Ascii,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             SettingItem::Theme => "Theme",

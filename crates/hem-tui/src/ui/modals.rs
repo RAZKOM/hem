@@ -11,10 +11,32 @@ use unicode_width::UnicodeWidthStr;
 use hem_core::timestamp::{format_ms, TsDisplay};
 
 use super::logpane::{display_text, line_spans};
-use super::widgets::{block, centered, fit, group, pad, wrap_spans};
+use super::widgets::{block, centered, dim, fit, group, pad, wrap_spans};
 use crate::app::{App, Hit};
-use crate::modal::FilterEditorState;
+use crate::modal::{FilterEditorState, Modal, SettingItem};
 use crate::theme::Theme;
+
+pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
+    let Some(modal) = app.modal.clone() else {
+        return;
+    };
+    dim(frame.buffer_mut(), area, &app.theme);
+    match modal {
+        Modal::Prompt { .. } => {}
+        Modal::Palette { input, selected } => palette(app, frame, area, &input.text, selected),
+        Modal::FilterEditor(st) => filter_editor(app, frame, area, &st),
+        Modal::Settings { selected } => settings(app, frame, area, selected),
+        Modal::Help { scroll } => help(app, frame, area, scroll),
+        Modal::Sources { selected } => sources(app, frame, area, selected),
+        Modal::Detail {
+            row_idx,
+            row,
+            scroll,
+            selected_field,
+        } => detail(app, frame, area, row_idx, row, scroll, selected_field),
+        Modal::Message { title, lines } => message(app, frame, area, &title, &lines),
+    }
+}
 
 fn frame_box(app: &mut App, frame: &mut Frame, area: Rect, title: &str, w: u16, h: u16) -> Rect {
     let r = centered(area, w, h);
@@ -276,6 +298,68 @@ fn filter_editor(app: &mut App, frame: &mut Frame, area: Rect, st: &FilterEditor
     if let Some((row, col)) = cy {
         frame.set_cursor_position((inner.x + lw as u16 + 2 + col.min(fw as u16), inner.y + row));
     }
+}
+
+fn settings(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
+    let w = area.width.min(60);
+    let h = area.height.min(15);
+    let inner = frame_box(app, frame, area, "Settings", w, h);
+    let theme = app.theme.clone();
+    let mut lines = Vec::new();
+    for (i, item) in SettingItem::ALL.iter().enumerate() {
+        let value = match item {
+            SettingItem::Theme => theme.name.clone(),
+            SettingItem::Collapse => onoff(app.config.defaults.collapse),
+            SettingItem::Timestamp => format!("{:?}", app.ts_display).to_lowercase(),
+            SettingItem::Wrap => onoff(app.config.defaults.wrap),
+            SettingItem::Follow => onoff(app.config.defaults.follow),
+            SettingItem::Columns => onoff(app.config.defaults.columns),
+            SettingItem::Minimap => onoff(app.config.defaults.minimap),
+            SettingItem::Mouse => onoff(app.config.defaults.mouse),
+            SettingItem::Ascii => onoff(app.config.defaults.ascii),
+        };
+        let lw = (inner.width as usize).saturating_sub(16);
+        let style = if i == selected {
+            theme.selection().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pad(&format!(" {}", item.label()), lw, app.ascii), style),
+            Span::styled(
+                format!(" {value:<13}"),
+                if i == selected {
+                    style.fg(theme.accent)
+                } else {
+                    theme.accent_style()
+                },
+            ),
+        ]));
+        app.hits.push((
+            Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            },
+            Hit::ModalItem(i),
+        ));
+    }
+    lines.push(Line::from(""));
+    let path = app
+        .config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(no config path)".into());
+    lines.push(footer(
+        &theme,
+        " Enter/Space/←→ change · changes are saved to:",
+    ));
+    lines.push(footer(
+        &theme,
+        &format!(" {}", fit(&path, inner.width as usize - 2, app.ascii)),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn onoff(b: bool) -> String {
@@ -621,4 +705,12 @@ fn detail(
     }
     let shown: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
     frame.render_widget(Paragraph::new(shown), inner);
+}
+
+fn message(app: &mut App, frame: &mut Frame, area: Rect, title: &str, body: &[String]) {
+    let w = area.width.min(70);
+    let h = area.height.min(body.len() as u16 + 4);
+    let inner = frame_box(app, frame, area, title, w, h);
+    let lines: Vec<Line> = body.iter().map(|l| Line::from(format!(" {l}"))).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
