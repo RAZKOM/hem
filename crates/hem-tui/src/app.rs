@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 
 use hem_core::cluster::{Clusters, Template};
 use hem_core::collapse::shape_hash;
-use hem_core::filter::{FieldPredicate, Filter, Matcher, TemplateMatch};
+use hem_core::filter::{FieldPredicate, Filter, FilterSpec, Matcher, TemplateMatch};
 use hem_core::format::Format;
 use hem_core::merge::Merged;
 use hem_core::parse::{parse_line, LineMeta, MetaCache};
@@ -26,7 +26,9 @@ use hem_core::{Level, Source};
 use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::keymap::{Action, KeyMap};
-use crate::modal::{Input, Modal, PromptKind, TemplateSort, TemplatesState};
+use crate::modal::{
+    FilterEditorState, Input, Modal, PromptKind, SettingItem, TemplateSort, TemplatesState,
+};
 use crate::theme::{Depth, Theme};
 use crate::RunOptions;
 
@@ -665,6 +667,47 @@ impl App {
         }
     }
 
+    pub fn merge_all(&mut self) {
+        let sources: Vec<Source> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.base.is_merged())
+            .flat_map(|t| t.base.sources())
+            .collect();
+        if sources.len() < 2 {
+            self.notice_warn("need at least two sources to merge");
+            return;
+        }
+        if let Some(i) = self.tabs.iter().position(|t| t.base.is_merged()) {
+            self.active = i;
+            return;
+        }
+        let t = self.tab();
+        let (filter, collapse, follow) = (t.filter.clone(), t.collapse, t.follow);
+        self.add_merged_tab(sources, filter, collapse, follow);
+        self.active = self.tabs.len() - 1;
+    }
+
+    pub fn close_tab(&mut self, i: usize) {
+        if self.tabs.len() <= 1 {
+            self.quit = true;
+            return;
+        }
+        if i < self.tabs.len() {
+            let t = self.tabs.remove(i);
+            t.view.cancel();
+            if let Some(s) = &t.search {
+                s.cancel();
+            }
+            if let Some(c) = &t.clusters {
+                c.cancel();
+            }
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            }
+        }
+    }
+
     // --- View rebuilding ---------------------------------------------------
 
     /// Rebuild the active tab's view after a filter / collapse change.
@@ -844,6 +887,41 @@ impl App {
 
     // --- Modals ---------------------------------------------------------------
 
+    fn open_prompt(&mut self, kind: PromptKind, initial: &str) {
+        self.modal = Some(Modal::Prompt {
+            kind,
+            input: Input::with(initial),
+        });
+    }
+
+    fn open_palette(&mut self) {
+        self.palette_items = self.build_palette_items();
+        self.modal = Some(Modal::Palette {
+            input: Input::default(),
+            selected: 0,
+        });
+    }
+
+    fn build_palette_items(&self) -> Vec<PaletteItem> {
+        let mut items: Vec<PaletteItem> = Action::ALL
+            .iter()
+            .map(|a| PaletteItem::Action(*a))
+            .collect();
+        for p in self.config.presets.keys() {
+            items.push(PaletteItem::Preset(p.clone()));
+        }
+        for t in Theme::names() {
+            items.push(PaletteItem::Theme(t.to_string()));
+        }
+        if self.tabs.len() > 1 {
+            items.push(PaletteItem::MergeAll);
+            for i in 0..self.tabs.len() {
+                items.push(PaletteItem::Tab(i));
+            }
+        }
+        items
+    }
+
     /// Palette entries matching the query, best first.
     pub fn palette_matches(&self, query: &str) -> Vec<(usize, i32)> {
         let mut v: Vec<(usize, i32)> = self
@@ -854,6 +932,101 @@ impl App {
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
+    }
+
+    pub fn apply_preset(&mut self, name: &str) {
+        let Some(spec) = self.config.presets.get(name).cloned() else {
+            self.notice_warn(format!("no preset {name}"));
+            return;
+        };
+        match Filter::from_spec(&spec) {
+            Ok(f) => {
+                self.tab_mut().filter = f;
+                self.rebuild_view();
+                self.notice(format!("preset {name}"));
+            }
+            Err(e) => self.notice_warn(e.to_string()),
+        }
+    }
+
+    pub fn set_theme(&mut self, name: &str) {
+        let Some(mut t) = Theme::by_name(name) else {
+            self.notice_warn(format!("unknown theme {name}"));
+            return;
+        };
+        t.apply_overrides(&self.config.colors);
+        let depth = self.theme.depth;
+        self.theme = t.adapt(depth);
+        self.config.theme = Some(name.to_string());
+        self.save_config();
+    }
+
+    pub fn save_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            self.notice_warn("no config path available");
+            return;
+        };
+        match self.config.save(&path) {
+            Ok(()) => self.notice(format!("saved {}", path.display())),
+            Err(e) => self.notice_warn(format!("save failed: {e}")),
+        }
+    }
+
+    fn open_filter_editor(&mut self) {
+        let f = &self.tab().filter;
+        let st = FilterEditorState {
+            include: Input::with(
+                &f.include
+                    .iter()
+                    .map(|m| m.text.clone())
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            ),
+            exclude: Input::with(
+                &f.exclude
+                    .iter()
+                    .map(|m| m.text.clone())
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            ),
+            fields: Input::with(
+                &f.fields
+                    .iter()
+                    .map(|p| p.display())
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            ),
+            since: Input::with(f.spec.since.as_deref().unwrap_or("")),
+            until: Input::with(f.spec.until.as_deref().unwrap_or("")),
+            level: f.min_level,
+            literal: f.spec.literal,
+            focus: 0,
+            error: None,
+        };
+        self.modal = Some(Modal::FilterEditor(Box::new(st)));
+    }
+
+    fn apply_filter_editor(&mut self, st: &FilterEditorState) -> Result<(), String> {
+        let split = |s: &str| -> Vec<String> {
+            s.split("&&")
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        };
+        let spec = FilterSpec {
+            include: split(&st.include.text),
+            exclude: split(&st.exclude.text),
+            level: st.level,
+            since: Some(st.since.text.trim().to_string()).filter(|s| !s.is_empty()),
+            until: Some(st.until.text.trim().to_string()).filter(|s| !s.is_empty()),
+            fields: split(&st.fields.text),
+            literal: st.literal,
+        };
+        let mut f = Filter::from_spec(&spec).map_err(|e| e.to_string())?;
+        f.template = self.tab().filter.template.clone();
+        self.tab_mut().filter = f;
+        self.rebuild_view();
+        Ok(())
     }
 
     fn open_detail(&mut self) {
@@ -969,7 +1142,137 @@ impl App {
         v
     }
 
+    pub fn remove_chip(&mut self, chip: Chip) {
+        let t = self.tab_mut();
+        let mut rebuild = true;
+        match chip {
+            Chip::Include(i) => {
+                if i < t.filter.include.len() {
+                    t.filter.include.remove(i);
+                }
+            }
+            Chip::Exclude(i) => {
+                if i < t.filter.exclude.len() {
+                    t.filter.exclude.remove(i);
+                }
+            }
+            Chip::Level => t.filter.min_level = None,
+            Chip::Time => {
+                t.filter.since = None;
+                t.filter.until = None;
+                t.filter.spec.since = None;
+                t.filter.spec.until = None;
+            }
+            Chip::Field(i) => {
+                if i < t.filter.fields.len() {
+                    t.filter.fields.remove(i);
+                }
+            }
+            Chip::Template => t.filter.template = None,
+            Chip::Search => {
+                rebuild = false;
+                if let Some(s) = t.search.take() {
+                    s.cancel();
+                }
+                t.search_text.clear();
+                t.current_match = None;
+            }
+            Chip::Highlight => {
+                rebuild = false;
+                t.highlight = None;
+            }
+        }
+        t.filter.sync_spec();
+        if rebuild {
+            self.rebuild_view();
+        }
+        self.mark_dirty();
+    }
+
     // --- Input ---------------------------------------------------------------
+
+    fn source_pick(&mut self, s: usize) {
+        if s < self.tabs.len() {
+            self.active = s;
+        } else if s == self.tabs.len() {
+            self.merge_all();
+        } else {
+            self.open_prompt(PromptKind::OpenFile, "");
+        }
+    }
+
+    fn toggle_setting(&mut self, item: SettingItem, forward: bool) {
+        match item {
+            SettingItem::Theme => {
+                let names = Theme::names();
+                let cur = names
+                    .iter()
+                    .position(|n| *n == self.theme.name)
+                    .unwrap_or(0);
+                let next = if forward {
+                    (cur + 1) % names.len()
+                } else {
+                    (cur + names.len() - 1) % names.len()
+                };
+                self.set_theme(names[next]);
+                return;
+            }
+            SettingItem::Collapse => {
+                self.config.defaults.collapse = !self.config.defaults.collapse;
+                let v = self.config.defaults.collapse;
+                if self.tab().collapse != v {
+                    self.tab_mut().collapse = v;
+                    self.rebuild_view();
+                }
+            }
+            SettingItem::Timestamp => {
+                let order = [
+                    TsDisplay::Original,
+                    TsDisplay::Time,
+                    TsDisplay::Iso,
+                    TsDisplay::Local,
+                    TsDisplay::Relative,
+                ];
+                let cur = order
+                    .iter()
+                    .position(|o| *o == self.ts_display)
+                    .unwrap_or(0);
+                let next = if forward {
+                    (cur + 1) % order.len()
+                } else {
+                    (cur + order.len() - 1) % order.len()
+                };
+                self.ts_display = order[next];
+                self.config.defaults.timestamp = self.ts_display;
+            }
+            SettingItem::Wrap => {
+                self.config.defaults.wrap = !self.config.defaults.wrap;
+                let v = self.config.defaults.wrap;
+                self.tab_mut().wrap = v;
+            }
+            SettingItem::Follow => {
+                self.config.defaults.follow = !self.config.defaults.follow;
+            }
+            SettingItem::Columns => {
+                self.config.defaults.columns = !self.config.defaults.columns;
+                let v = self.config.defaults.columns;
+                self.tab_mut().columns = v;
+            }
+            SettingItem::Minimap => {
+                self.config.defaults.minimap = !self.config.defaults.minimap;
+                self.minimap = self.config.defaults.minimap;
+            }
+            SettingItem::Mouse => {
+                self.config.defaults.mouse = !self.config.defaults.mouse;
+                self.notice("mouse setting applies on next start");
+            }
+            SettingItem::Ascii => {
+                self.config.defaults.ascii = !self.config.defaults.ascii;
+                self.ascii = self.config.defaults.ascii;
+            }
+        }
+        self.save_config();
+    }
 
     fn submit_prompt(&mut self, kind: PromptKind, text: &str) {
         let text = text.trim();
@@ -1053,6 +1356,15 @@ impl App {
     }
 
     // --- Mouse -----------------------------------------------------------------
+
+    fn hit_at(&self, x: u16, y: u16) -> Option<Hit> {
+        // Later entries are drawn on top; search from the end.
+        self.hits
+            .iter()
+            .rev()
+            .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(_, h)| h.clone())
+    }
 
 }
 

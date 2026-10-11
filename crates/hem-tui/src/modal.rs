@@ -11,6 +11,13 @@ pub struct Input {
 }
 
 impl Input {
+    pub fn with(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            cursor: text.chars().count(),
+        }
+    }
+
     fn byte_at(&self, idx: usize) -> usize {
         self.text
             .char_indices()
@@ -143,6 +150,19 @@ pub struct FilterEditorState {
 }
 
 impl FilterEditorState {
+    pub const FIELDS: usize = 9;
+
+    pub fn input_mut(&mut self) -> Option<&mut Input> {
+        match self.focus {
+            0 => Some(&mut self.include),
+            1 => Some(&mut self.exclude),
+            2 => Some(&mut self.fields),
+            4 => Some(&mut self.since),
+            5 => Some(&mut self.until),
+            _ => None,
+        }
+    }
+
     pub fn cycle_level(&mut self, forward: bool) {
         let order: [Option<Level>; 7] = [
             None,
@@ -327,6 +347,27 @@ impl Modal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_editing() {
+        let mut i = Input::with("héllo");
+        assert_eq!(i.cursor, 5);
+        i.left();
+        i.left();
+        i.insert('X');
+        assert_eq!(i.text, "hélXlo");
+        i.backspace();
+        assert_eq!(i.text, "héllo");
+        i.home();
+        i.delete();
+        assert_eq!(i.text, "éllo");
+        i.end();
+        i.delete_word();
+        assert_eq!(i.text, "");
+        let mut i = Input::with("a b c");
+        i.kill_to_start();
+        assert_eq!(i.text, "");
+    }
 
     #[test]
     fn level_cycle_wraps() {
