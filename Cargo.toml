@@ -52,6 +52,8 @@ glob = "0.3"
 regex.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
+flate2 = "1"
 
 [profile.release]
 lto = "thin"

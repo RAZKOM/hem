@@ -1,0 +1,8 @@
+Oct 13 10:02:11 web01 systemd[1]: Started nginx.service.
+Oct 13 10:02:12 web01 sshd[1234]: Accepted publickey for bob from 10.0.0.12 port 51234 ssh2
+Oct 13 10:02:13 web01 kernel: [12345.678901] eth0: link up
+Oct 13 10:02:14 web01 sshd[1235]: error: maximum authentication attempts exceeded for root from 10.0.0.99 port 4242 ssh2
+Oct 13 10:02:15 web01 cron[777]: (root) CMD (run-parts /etc/cron.hourly)
+Oct 13 10:02:16 web01 app[2001]: WARN slow query (812ms)
+Oct 13 10:02:17 web01 app[2001]: ERROR connection reset by peer
+<34>Oct 13 10:02:18 web01 su: 'su root' failed for alice on /dev/pts/8

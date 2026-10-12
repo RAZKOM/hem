@@ -1,0 +1,17 @@
+2026-10-13 10:02:11.204 INFO  [api] server started on :8080
+2026-10-13 10:02:14.880 WARN  [api] slow query (812ms) query="SELECT * FROM orders"
+2026-10-13 10:02:15.001 ERROR [api] connection reset by peer request_id=req-1a2b3c
+2026-10-13 10:02:15.002 ERROR [api] connection reset by peer request_id=req-1a2b3d
+2026-10-13 10:02:15.003 ERROR [api] connection reset by peer request_id=req-1a2b3e
+2026-10-13 10:02:15.004 ERROR [api] connection reset by peer request_id=req-1a2b3f
+2026-10-13 10:02:15.500 ERROR [worker] upstream timeout
+java.lang.IllegalStateException: upstream failure
+	at com.example.worker.WorkerHandler.handle(WorkerHandler.java:142)
+	at com.example.worker.WorkerHandler.run(WorkerHandler.java:88)
+	... 12 more
+2026-10-13 10:02:16.100 INFO  [auth] user bob logged in from 10.0.0.12
+2026-10-13 10:02:16.200 INFO  [auth] user alice logged in from 10.0.0.13
+2026-10-13 10:02:17.300 DEBUG [api] cache miss key=orders:42
+2026-10-13 10:02:18.500 INFO  [api] GET https://example.com/api/v1/orders 200 12ms
+2026-10-13 10:02:19.700 FATAL [worker] disk quota exceeded on /var/lib/app
+2026-10-13 10:02:20.900 INFO  [api] request completed status=200 duration=9ms

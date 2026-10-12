@@ -751,10 +751,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "glob",
  "hem-core",
  "hem-tui",
  "regex",
+ "tempfile",
 ]
 
 [[package]]
