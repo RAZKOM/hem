@@ -40,6 +40,12 @@ impl Input {
         self.cursor += 1;
     }
 
+    pub fn insert_str(&mut self, s: &str) {
+        for c in s.chars().filter(|c| !c.is_control()) {
+            self.insert(c);
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;

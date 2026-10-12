@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use hem_core::cluster::{Clusters, Template};
@@ -1442,6 +1442,26 @@ impl App {
 
     // --- Input ---------------------------------------------------------------
 
+    pub fn handle_resize(&mut self, w: u16, h: u16) {
+        self.size = (w, h);
+        self.mark_dirty();
+    }
+
+    pub fn handle_paste(&mut self, s: &str) {
+        if let Some(m) = self.modal.as_mut() {
+            match m {
+                Modal::Prompt { input, .. } | Modal::Palette { input, .. } => input.insert_str(s),
+                Modal::FilterEditor(st) => {
+                    if let Some(i) = st.input_mut() {
+                        i.insert_str(s);
+                    }
+                }
+                _ => {}
+            }
+            self.mark_dirty();
+        }
+    }
+
     fn modal_key(&mut self, ev: KeyEvent) {
         let Some(mut modal) = self.modal.take() else {
             return;
@@ -1818,6 +1838,200 @@ impl App {
             .map(|(_, h)| h.clone())
     }
 
+    pub fn handle_mouse(&mut self, ev: MouseEvent) {
+        if !self.mouse {
+            return;
+        }
+        self.mark_dirty();
+        let (x, y) = (ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::ScrollDown => {
+                if let Some(m) = self.modal.as_mut() {
+                    match m {
+                        Modal::Help { scroll } | Modal::Detail { scroll, .. } => *scroll += 3,
+                        _ => {}
+                    }
+                } else if self.templates_mode {
+                    let n = self.sorted_templates().len();
+                    let t = self.tab_mut();
+                    if n > 0 {
+                        t.templates.selected = (t.templates.selected + 3).min(n - 1);
+                    }
+                } else {
+                    self.scroll_by(3);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(m) = self.modal.as_mut() {
+                    match m {
+                        Modal::Help { scroll } | Modal::Detail { scroll, .. } => {
+                            *scroll = scroll.saturating_sub(3)
+                        }
+                        _ => {}
+                    }
+                } else if self.templates_mode {
+                    let t = self.tab_mut();
+                    t.templates.selected = t.templates.selected.saturating_sub(3);
+                } else {
+                    self.scroll_by(-3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self.hit_at(x, y);
+                self.minimap_drag = matches!(hit, Some(Hit::Minimap { .. } | Hit::Track { .. }));
+                if let Some(h) = hit {
+                    self.click(h, x, y);
+                } else if self.modal.is_some() {
+                    // Click outside a modal closes it.
+                    self.modal = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.minimap_drag {
+                    if let Some(h @ (Hit::Minimap { .. } | Hit::Track { .. })) = self.hit_at(x, y) {
+                        self.click(h, x, y);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.minimap_drag = false,
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, hit: Hit, _x: u16, _y: u16) {
+        match hit {
+            Hit::Tab(i) => {
+                if i < self.tabs.len() {
+                    self.active = i;
+                }
+            }
+            Hit::Chip(i) => {
+                if let Some(c) = self.chips.get(i).cloned() {
+                    self.remove_chip(c);
+                }
+            }
+            Hit::ClearChips => {
+                self.do_action(Action::ClearFilters);
+                self.do_action(Action::ClearSearch);
+                self.tab_mut().highlight = None;
+            }
+            Hit::Row(r) => {
+                if self.modal.is_none() {
+                    let was = self.tab().cursor;
+                    self.set_cursor(r);
+                    self.tab_mut().follow = false;
+                    if was == r {
+                        // Second click on the same row opens detail / expands.
+                        self.do_action(Action::Expand);
+                    }
+                }
+            }
+            Hit::Minimap { cell, cells } => self.jump_minimap(cell, cells),
+            Hit::Track { cell, cells } => {
+                self.jump_to_fraction((cell as f64 + 0.5) / cells.max(1) as f64)
+            }
+            Hit::Scrollbar => {}
+            Hit::Action(a) => self.do_action(a),
+            Hit::ModalItem(i) => self.modal_item_click(i),
+            Hit::ModalClose => self.modal = None,
+            Hit::TemplateRow(i) => {
+                let t = self.tab_mut();
+                if t.templates.selected == i {
+                    self.apply_selected_template();
+                } else {
+                    t.templates.selected = i;
+                }
+            }
+            Hit::TemplateHeader(col) => {
+                let t = self.tab_mut();
+                let s = TemplateSort::ALL[col.min(TemplateSort::ALL.len() - 1)];
+                if t.templates.sort == s {
+                    t.templates.ascending = !t.templates.ascending;
+                } else {
+                    t.templates.sort = s;
+                }
+                t.templates.selected = 0;
+            }
+            Hit::Prompt => {}
+        }
+    }
+
+    fn jump_minimap(&mut self, cell: usize, cells: usize) {
+        let t = self.tab();
+        let hist = t.view.histogram();
+        if hist.total == 0 || cells == 0 {
+            self.jump_to_fraction(cell as f64 / cells as f64);
+            return;
+        }
+        let (key, _) = hist.cell_range(cell, cells);
+        if hist.is_time() {
+            self.jump_to_timestamp(key);
+        } else {
+            let n = t.len();
+            self.center_on((key.max(0) as usize).min(n.saturating_sub(1)));
+        }
+    }
+
+    fn modal_item_click(&mut self, i: usize) {
+        let Some(modal) = self.modal.clone() else {
+            return;
+        };
+        match modal {
+            Modal::Palette { input, .. } => {
+                let matches = self.palette_matches(&input.text);
+                if let Some((idx, _)) = matches.get(i) {
+                    let item = self.palette_items[*idx].clone();
+                    self.modal = None;
+                    self.run_palette_item(item);
+                }
+            }
+            Modal::Settings { .. } => {
+                if let Some(item) = SettingItem::ALL.get(i) {
+                    self.modal = Some(Modal::Settings { selected: i });
+                    self.toggle_setting(*item, true);
+                }
+            }
+            Modal::Sources { .. } => {
+                self.modal = None;
+                self.source_pick(i);
+            }
+            Modal::FilterEditor(mut st) => {
+                st.focus = i.min(FilterEditorState::FIELDS - 1);
+                match st.focus {
+                    3 => st.cycle_level(true),
+                    6 => st.literal = !st.literal,
+                    7 => {
+                        if let Err(e) = self.apply_filter_editor(&st) {
+                            st.error = Some(e);
+                        } else {
+                            return;
+                        }
+                    }
+                    8 => {
+                        self.tab_mut().filter = Filter::default();
+                        self.rebuild_view();
+                        return;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::FilterEditor(st));
+            }
+            Modal::Detail {
+                row_idx,
+                row,
+                scroll,
+                ..
+            } => {
+                self.modal = Some(Modal::Detail {
+                    row_idx,
+                    row,
+                    scroll,
+                    selected_field: i,
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Apply a key event to a text input (shared by prompts and editors).

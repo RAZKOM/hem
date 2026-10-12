@@ -120,6 +120,14 @@ impl Histogram {
         self.total += 1;
     }
 
+    /// Start key of bucket `b`.
+    pub fn key_at(&self, b: usize) -> i64 {
+        match self.axis {
+            Axis::Time { start, bucket_ms } => start + b as i64 * bucket_ms,
+            Axis::Position { bucket_rows } => (b as u64 * bucket_rows) as i64,
+        }
+    }
+
     /// Bucket index containing `key` (no folding; clamped).
     pub fn bucket_of(&self, key: i64) -> usize {
         let idx = match self.axis {
@@ -144,6 +152,14 @@ impl Histogram {
             }
         }
         out
+    }
+
+    /// Key range covered by display cell `cell` of `n` (start key, end key).
+    pub fn cell_range(&self, cell: usize, n: usize) -> (i64, i64) {
+        let used = self.used.max(1);
+        let b0 = cell * used / n.max(1);
+        let b1 = ((cell + 1) * used / n.max(1)).max(b0 + 1);
+        (self.key_at(b0), self.key_at(b1))
     }
 
     /// Display cell for a key.
