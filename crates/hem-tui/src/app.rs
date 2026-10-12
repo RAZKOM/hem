@@ -23,7 +23,7 @@ use hem_core::timestamp::{self, TsDisplay};
 use hem_core::view::{Base, Row, View, ViewSpec};
 use hem_core::{Level, Source};
 
-use crate::clipboard::Clipboard;
+use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::config::Config;
 use crate::keymap::{Action, KeyMap};
 use crate::modal::{
@@ -825,6 +825,210 @@ impl App {
 
     // --- Actions -----------------------------------------------------------
 
+    pub fn do_action(&mut self, action: Action) {
+        self.log_debug(&format!("action: {action:?}"));
+        self.mark_dirty();
+        let page = self.page_size();
+        match action {
+            Action::ScrollUp => self.scroll_by(-1),
+            Action::ScrollDown => self.scroll_by(1),
+            Action::ScrollLeft => {
+                let t = self.tab_mut();
+                t.hscroll = t.hscroll.saturating_sub(8);
+            }
+            Action::ScrollRight => {
+                let t = self.tab_mut();
+                t.hscroll += 8;
+            }
+            Action::PageUp => self.scroll_by(-(page as isize)),
+            Action::PageDown => self.scroll_by(page as isize),
+            Action::HalfPageUp => self.scroll_by(-((page / 2).max(1) as isize)),
+            Action::HalfPageDown => self.scroll_by((page / 2).max(1) as isize),
+            Action::Top => {
+                self.set_cursor(0);
+                self.tab_mut().follow = false;
+            }
+            Action::Bottom => self.go_bottom(),
+            Action::ToggleFollow => {
+                let f = !self.tab().follow;
+                self.tab_mut().follow = f;
+                if f {
+                    self.go_bottom();
+                    self.notice("following");
+                } else {
+                    self.notice("follow off");
+                }
+            }
+            Action::Search => self.open_prompt(PromptKind::Search, &self.tab().search_text.clone()),
+            Action::NextMatch => self.jump_match(true),
+            Action::PrevMatch => self.jump_match(false),
+            Action::ClearSearch => {
+                let t = self.tab_mut();
+                if let Some(s) = t.search.take() {
+                    s.cancel();
+                }
+                t.search_text.clear();
+                t.current_match = None;
+            }
+            Action::Filter => self.open_prompt(PromptKind::Include, ""),
+            Action::Exclude => self.open_prompt(PromptKind::Exclude, ""),
+            Action::FieldFilter => self.open_prompt(PromptKind::Field, ""),
+            Action::FilterEditor => self.open_filter_editor(),
+            Action::ClearFilters => {
+                let t = self.tab_mut();
+                if t.filter.is_empty() {
+                    return;
+                }
+                t.filter = Filter::default();
+                self.rebuild_view();
+                self.notice("filters cleared");
+            }
+            Action::CycleLevel => {
+                let t = self.tab_mut();
+                t.filter.min_level = match t.filter.min_level {
+                    None => Some(Level::Debug),
+                    Some(Level::Debug) => Some(Level::Info),
+                    Some(Level::Info) => Some(Level::Warn),
+                    Some(Level::Warn) => Some(Level::Error),
+                    Some(Level::Error) => Some(Level::Fatal),
+                    _ => None,
+                };
+                t.filter.sync_spec();
+                let msg = match t.filter.min_level {
+                    Some(l) => format!("level ≥ {l}"),
+                    None => "all levels".to_string(),
+                };
+                self.rebuild_view();
+                self.notice(msg);
+            }
+            Action::NextError => self.jump_error(true),
+            Action::PrevError => self.jump_error(false),
+            Action::ToggleCollapse => {
+                let t = self.tab_mut();
+                t.collapse = !t.collapse;
+                let on = t.collapse;
+                self.rebuild_view();
+                self.notice(if on {
+                    "collapsing repeats"
+                } else {
+                    "showing every line"
+                });
+            }
+            Action::Expand => {
+                let t = self.tab_mut();
+                let c = t.cursor;
+                if t.view.row(c).map(|r| r.count() > 1).unwrap_or(false) {
+                    if !t.expanded.remove(&c) {
+                        t.expanded.insert(c);
+                    }
+                } else {
+                    self.open_detail();
+                }
+            }
+            Action::Templates => self.toggle_templates(),
+            Action::Detail => {
+                if self.templates_mode {
+                    self.apply_selected_template();
+                } else {
+                    self.open_detail();
+                }
+            }
+            Action::Pin => {
+                let t = self.tab_mut();
+                if let Some(r) = t.view.row(t.cursor) {
+                    let key = (r.source(), r.line());
+                    if let Some(i) = t.pins.iter().position(|p| *p == key) {
+                        t.pins.remove(i);
+                        self.notice("unpinned");
+                    } else {
+                        t.pins.push(key);
+                        self.notice("pinned");
+                    }
+                }
+            }
+            Action::HighlightValue => self.open_prompt(PromptKind::Highlight, ""),
+            Action::ClearHighlight => {
+                self.tab_mut().highlight = None;
+            }
+            Action::Copy => self.copy_current_line(),
+            Action::CopyView => self.copy_visible(),
+            Action::ToggleWrap => {
+                let t = self.tab_mut();
+                t.wrap = !t.wrap;
+                t.hscroll = 0;
+            }
+            Action::ToggleColumns => {
+                let t = self.tab_mut();
+                t.columns = !t.columns;
+            }
+            Action::CycleTimestamp => {
+                self.ts_display = match self.ts_display {
+                    TsDisplay::Original => TsDisplay::Time,
+                    TsDisplay::Time => TsDisplay::Iso,
+                    TsDisplay::Iso => TsDisplay::Local,
+                    TsDisplay::Local => TsDisplay::Relative,
+                    TsDisplay::Relative => TsDisplay::Original,
+                };
+                self.notice(format!("timestamps: {:?}", self.ts_display).to_lowercase());
+            }
+            Action::NextTab => {
+                if self.tabs.len() > 1 {
+                    self.active = (self.active + 1) % self.tabs.len();
+                }
+            }
+            Action::PrevTab => {
+                if self.tabs.len() > 1 {
+                    self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+                }
+            }
+            Action::Sources => {
+                self.modal = Some(Modal::Sources {
+                    selected: self.active,
+                })
+            }
+            Action::OpenFile => self.open_prompt(PromptKind::OpenFile, ""),
+            Action::Goto => self.open_prompt(PromptKind::Goto, ""),
+            Action::Palette => self.open_palette(),
+            Action::Settings => self.modal = Some(Modal::Settings { selected: 0 }),
+            Action::Help => self.modal = Some(Modal::Help { scroll: 0 }),
+            Action::Close => {
+                if self.modal.is_some() {
+                    self.modal = None;
+                } else if self.templates_mode {
+                    self.templates_mode = false;
+                } else {
+                    self.quit = true;
+                }
+            }
+            Action::Quit => {
+                if self.modal.is_some() {
+                    self.modal = None;
+                } else if self.templates_mode {
+                    self.templates_mode = false;
+                } else {
+                    self.quit = true;
+                }
+            }
+            Action::SortTemplates => {
+                let t = self.tab_mut();
+                t.templates.sort = t.templates.sort.next();
+                t.templates.selected = 0;
+                t.templates.scroll = 0;
+            }
+            Action::SortTemplatesReverse => {
+                let t = self.tab_mut();
+                t.templates.ascending = !t.templates.ascending;
+                t.templates.selected = 0;
+                t.templates.scroll = 0;
+            }
+            Action::Refresh => {
+                for s in self.tab().base.sources() {
+                    s.poke();
+                }
+            }
+        }
+    }
+
     fn jump_match(&mut self, forward: bool) {
         let t = self.tab();
         let Some(s) = &t.search else {
@@ -885,6 +1089,39 @@ impl App {
         self.center_on(row);
     }
 
+    fn copy_text(&mut self, text: String, what: &str) {
+        match self.clipboard.copy(&text) {
+            CopyOutcome::System => self.notice(format!("copied {what}")),
+            CopyOutcome::Osc52(seq) => {
+                self.osc52 = Some(seq);
+                self.notice(format!("copied {what} (OSC 52)"));
+            }
+        }
+    }
+
+    fn copy_current_line(&mut self) {
+        let t = self.tab();
+        let Some(row) = t.view.row(t.cursor) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&t.line_bytes(row)).into_owned();
+        self.copy_text(text, "line");
+    }
+
+    fn copy_visible(&mut self) {
+        let t = self.tab();
+        let rows: Vec<usize> = t.last_visible.iter().map(|(r, _, _)| *r).collect();
+        let mut out = String::new();
+        for r in rows {
+            if let Some(row) = t.view.row(r) {
+                out.push_str(&String::from_utf8_lossy(&t.line_bytes(row)));
+                out.push('\n');
+            }
+        }
+        let n = out.lines().count();
+        self.copy_text(out, &format!("{n} lines"));
+    }
+
     // --- Modals ---------------------------------------------------------------
 
     fn open_prompt(&mut self, kind: PromptKind, initial: &str) {
@@ -932,6 +1169,20 @@ impl App {
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
+    }
+
+    fn run_palette_item(&mut self, item: PaletteItem) {
+        match item {
+            PaletteItem::Action(a) => self.do_action(a),
+            PaletteItem::Preset(p) => self.apply_preset(&p),
+            PaletteItem::Theme(t) => self.set_theme(&t),
+            PaletteItem::MergeAll => self.merge_all(),
+            PaletteItem::Tab(i) => {
+                if i < self.tabs.len() {
+                    self.active = i;
+                }
+            }
+        }
     }
 
     pub fn apply_preset(&mut self, name: &str) {
@@ -1190,6 +1441,207 @@ impl App {
     }
 
     // --- Input ---------------------------------------------------------------
+
+    fn modal_key(&mut self, ev: KeyEvent) {
+        let Some(mut modal) = self.modal.take() else {
+            return;
+        };
+        let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+        let mut keep = true;
+        match &mut modal {
+            Modal::Prompt { kind, input } => match ev.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Enter => {
+                    let text = input.text.clone();
+                    let kind = *kind;
+                    keep = false;
+                    self.submit_prompt(kind, &text);
+                }
+                _ => edit_input(input, &ev),
+            },
+            Modal::Palette { input, selected } => match ev.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Enter => {
+                    let matches = self.palette_matches(&input.text);
+                    if let Some((idx, _)) = matches.get(*selected) {
+                        let item = self.palette_items[*idx].clone();
+                        self.modal = None;
+                        self.run_palette_item(item);
+                        return;
+                    }
+                    keep = false;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    let n = self.palette_matches(&input.text).len();
+                    if n > 0 {
+                        *selected = (*selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Up | KeyCode::BackTab => *selected = selected.saturating_sub(1),
+                KeyCode::Char('n') if ctrl => {
+                    let n = self.palette_matches(&input.text).len();
+                    if n > 0 {
+                        *selected = (*selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Char('p') if ctrl => *selected = selected.saturating_sub(1),
+                _ => {
+                    edit_input(input, &ev);
+                    *selected = 0;
+                }
+            },
+            Modal::FilterEditor(st) => match ev.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Tab | KeyCode::Down => {
+                    st.focus = (st.focus + 1) % FilterEditorState::FIELDS
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    st.focus =
+                        (st.focus + FilterEditorState::FIELDS - 1) % FilterEditorState::FIELDS
+                }
+                KeyCode::Enter => match st.focus {
+                    3 => st.cycle_level(true),
+                    6 => st.literal = !st.literal,
+                    8 => {
+                        self.tab_mut().filter = Filter::default();
+                        self.rebuild_view();
+                        keep = false;
+                    }
+                    _ => match self.apply_filter_editor(st) {
+                        Ok(()) => keep = false,
+                        Err(e) => st.error = Some(e),
+                    },
+                },
+                KeyCode::Left if st.focus == 3 => st.cycle_level(false),
+                KeyCode::Right if st.focus == 3 => st.cycle_level(true),
+                KeyCode::Char(' ') if st.focus == 6 => st.literal = !st.literal,
+                KeyCode::Char(' ') if st.focus == 3 => st.cycle_level(true),
+                _ => {
+                    if let Some(i) = st.input_mut() {
+                        edit_input(i, &ev);
+                    }
+                }
+            },
+            Modal::Settings { selected } => {
+                let items = SettingItem::ALL;
+                match ev.code {
+                    KeyCode::Esc | KeyCode::Char('q') => keep = false,
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        *selected = (*selected + 1) % items.len()
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                        *selected = (*selected + items.len() - 1) % items.len()
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left => {
+                        let forward = ev.code != KeyCode::Left;
+                        let item = items[*selected];
+                        self.toggle_setting(item, forward);
+                    }
+                    KeyCode::Char('s') => self.save_config(),
+                    _ => {}
+                }
+            }
+            Modal::Help { scroll } => match ev.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                    keep = false
+                }
+                KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => *scroll += 10,
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                _ => {}
+            },
+            Modal::Sources { selected } => {
+                let n = self.tabs.len() + 2; // tabs + "merge all" + "open file…"
+                match ev.code {
+                    KeyCode::Esc | KeyCode::Char('q') => keep = false,
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        *selected = (*selected + 1) % n
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                        *selected = (*selected + n - 1) % n
+                    }
+                    KeyCode::Enter => {
+                        let s = *selected;
+                        keep = false;
+                        self.source_pick(s);
+                    }
+                    KeyCode::Char('d') | KeyCode::Delete => {
+                        let s = *selected;
+                        if s < self.tabs.len() {
+                            self.close_tab(s);
+                            *selected = s.min(self.tabs.len().saturating_sub(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Modal::Detail {
+                row_idx,
+                row,
+                scroll,
+                selected_field,
+            } => match ev.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => keep = false,
+                KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::PageDown => *scroll += 10,
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                KeyCode::Tab => *selected_field += 1,
+                KeyCode::BackTab => *selected_field = selected_field.saturating_sub(1),
+                KeyCode::Char('n') | KeyCode::Char(']') => {
+                    let next = *row_idx + 1;
+                    if let Some(r) = self.tab().view.row(next) {
+                        *row_idx = next;
+                        *row = r;
+                        *scroll = 0;
+                        self.set_cursor(next);
+                    }
+                }
+                KeyCode::Char('N') | KeyCode::Char('[') => {
+                    if *row_idx > 0 {
+                        let prev = *row_idx - 1;
+                        if let Some(r) = self.tab().view.row(prev) {
+                            *row_idx = prev;
+                            *row = r;
+                            *scroll = 0;
+                            self.set_cursor(prev);
+                        }
+                    }
+                }
+                KeyCode::Char('y') => {
+                    let text = String::from_utf8_lossy(&self.tab().line_bytes(*row)).into_owned();
+                    self.copy_text(text, "line");
+                }
+                KeyCode::Char('p') => {
+                    let key = (row.source(), row.line());
+                    let t = self.tab_mut();
+                    if let Some(i) = t.pins.iter().position(|p| *p == key) {
+                        t.pins.remove(i);
+                    } else {
+                        t.pins.push(key);
+                    }
+                }
+                KeyCode::Char('*') => {
+                    let t = self.tab();
+                    let line = t.line_bytes(*row);
+                    let fields = hem_core::fields::extract(&line, t.format_for(row.source()));
+                    if let Some((_, v)) = fields.get(*selected_field) {
+                        if let Ok(m) = Matcher::new(v, true) {
+                            self.tab_mut().highlight = Some(m);
+                            self.notice(format!("highlighting {}", truncate(v, 40)));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Modal::Message { .. } => keep = false,
+        }
+        if keep {
+            self.modal = Some(modal);
+        }
+    }
 
     fn source_pick(&mut self, s: usize) {
         if s < self.tabs.len() {

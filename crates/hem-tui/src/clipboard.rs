@@ -34,6 +34,24 @@ impl Clipboard {
                 || std::env::var_os("SSH_TTY").is_some(),
         }
     }
+
+    /// Copy text.  Prefers the system clipboard unless we are over SSH (or
+    /// `HEM_OSC52` is set), in which case OSC 52 is emitted so the *local*
+    /// terminal receives it.
+    pub fn copy(&mut self, text: &str) -> CopyOutcome {
+        if !self.force_osc52 {
+            if !self.tried {
+                self.tried = true;
+                self.inner = arboard::Clipboard::new().ok();
+            }
+            if let Some(cb) = self.inner.as_mut() {
+                if cb.set_text(text.to_string()).is_ok() {
+                    return CopyOutcome::System;
+                }
+            }
+        }
+        CopyOutcome::Osc52(osc52(text))
+    }
 }
 
 /// Build an OSC 52 "set clipboard" escape sequence.
