@@ -52,8 +52,13 @@ glob = "0.3"
 regex.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false }
 tempfile.workspace = true
 flate2 = "1"
+
+[[bench]]
+name = "index"
+harness = false
 
 [profile.release]
 lto = "thin"
