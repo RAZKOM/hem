@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 /// Everything the user can do.  Each action has a stable config name
@@ -250,6 +250,28 @@ impl Key {
         Key::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// Normalise a crossterm event: drop SHIFT for printable characters
+    /// (the character already carries the case).
+    pub fn from_event(ev: &KeyEvent) -> Key {
+        let mut mods = ev.modifiers;
+        let code = match ev.code {
+            KeyCode::Char(c) => {
+                mods.remove(KeyModifiers::SHIFT);
+                if mods.contains(KeyModifiers::CONTROL) {
+                    KeyCode::Char(c.to_ascii_lowercase())
+                } else {
+                    KeyCode::Char(c)
+                }
+            }
+            KeyCode::BackTab => {
+                mods.remove(KeyModifiers::SHIFT);
+                KeyCode::BackTab
+            }
+            other => other,
+        };
+        Key { code, mods }
+    }
+
     /// Parse `ctrl+p`, `shift+tab`, `G`, `pgdn`, `enter`.
     pub fn parse(s: &str) -> Option<Key> {
         let s = s.trim();
@@ -474,6 +496,10 @@ impl KeyMap {
             .map(|(_, a)| *a)
     }
 
+    pub fn lookup_event(&self, ev: &KeyEvent) -> Option<Action> {
+        self.lookup(Key::from_event(ev))
+    }
+
     /// All keys bound to an action.
     pub fn keys_for(&self, action: Action) -> Vec<Key> {
         self.bindings
@@ -578,6 +604,17 @@ mod tests {
         assert_eq!(km.lookup(Key::ch('e')), None);
         assert_eq!(km.lookup(Key::ctrl('n')), Some(Action::NextError));
         assert_eq!(km.keys_label(Action::NextError, true), "F8 / Ctrl+n");
+    }
+
+    #[test]
+    fn event_normalisation() {
+        let ev = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(Key::from_event(&ev), Key::ch('G'));
+        let ev = KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(Key::from_event(&ev), Key::ctrl('p'));
     }
 
     #[test]

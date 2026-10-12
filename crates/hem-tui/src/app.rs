@@ -25,7 +25,7 @@ use hem_core::{Level, Source};
 
 use crate::clipboard::{Clipboard, CopyOutcome};
 use crate::config::Config;
-use crate::keymap::{Action, KeyMap};
+use crate::keymap::{Action, Key, KeyMap};
 use crate::modal::{
     FilterEditorState, Input, Modal, PromptKind, SettingItem, TemplateSort, TemplatesState,
 };
@@ -1459,6 +1459,89 @@ impl App {
                 _ => {}
             }
             self.mark_dirty();
+        }
+    }
+
+    pub fn handle_key(&mut self, ev: KeyEvent) {
+        self.mark_dirty();
+        if self.modal.is_some() {
+            self.modal_key(ev);
+            return;
+        }
+        if self.templates_mode && self.templates_key(ev) {
+            return;
+        }
+        if let Some(action) = self.keymap.lookup_event(&ev) {
+            self.do_action(action);
+        }
+    }
+
+    fn templates_key(&mut self, ev: KeyEvent) -> bool {
+        let n = self.sorted_templates().len();
+        let t = self.tab_mut();
+        if t.templates.filtering {
+            match ev.code {
+                KeyCode::Esc => {
+                    t.templates.filtering = false;
+                    t.templates.filter.clear();
+                }
+                KeyCode::Enter => t.templates.filtering = false,
+                KeyCode::Backspace => t.templates.filter.backspace(),
+                KeyCode::Char(c) if !ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    t.templates.filter.insert(c);
+                    t.templates.selected = 0;
+                }
+                _ => {}
+            }
+            return true;
+        }
+        let key = Key::from_event(&ev);
+        match key.code {
+            KeyCode::Char('/') => {
+                t.templates.filtering = true;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if n > 0 {
+                    t.templates.selected = (t.templates.selected + 1).min(n - 1);
+                }
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                t.templates.selected = t.templates.selected.saturating_sub(1);
+                true
+            }
+            KeyCode::PageDown => {
+                if n > 0 {
+                    t.templates.selected = (t.templates.selected + 20).min(n - 1);
+                }
+                true
+            }
+            KeyCode::PageUp => {
+                t.templates.selected = t.templates.selected.saturating_sub(20);
+                true
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                t.templates.selected = 0;
+                true
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                t.templates.selected = n.saturating_sub(1);
+                true
+            }
+            KeyCode::Enter => {
+                self.apply_selected_template();
+                true
+            }
+            KeyCode::Char('y') => {
+                let list = self.sorted_templates();
+                if let Some(tp) = list.get(self.tab().templates.selected) {
+                    let s = tp.display();
+                    self.copy_text(s, "template");
+                }
+                true
+            }
+            _ => false,
         }
     }
 
