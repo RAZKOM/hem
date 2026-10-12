@@ -754,6 +754,7 @@ dependencies = [
  "glob",
  "hem-core",
  "hem-tui",
+ "regex",
 ]
 
 [[package]]
