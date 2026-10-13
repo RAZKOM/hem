@@ -250,3 +250,6 @@ Releases: tag `v*` to run `.github/workflows/release.yml` (cargo-dist),
 which builds all six targets, uploads them to GitHub Releases and generates
 the shell / PowerShell installers.
 
+## License
+
+MIT OR Apache-2.0, at your option.

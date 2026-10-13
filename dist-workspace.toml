@@ -1,0 +1,32 @@
+# cargo-dist configuration (https://opensource.axo.dev/cargo-dist/).
+#
+# Tagging `v*` runs .github/workflows/release.yml, which builds the targets
+# below, uploads archives + checksums to the GitHub Release and generates
+# the shell / PowerShell installers.  Regenerate the workflow after editing
+# this file with `dist generate` (`cargo install cargo-dist`).
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+# Build the `hem` package only (not the library crates).
+packages = ["hem"]
+# Archive layout expected by the cargo-binstall metadata in Cargo.toml.
+windows-archive = ".zip"
+unix-archive = ".tar.gz"
+install-path = "CARGO_HOME"
+pr-run-mode = "plan"
+checksum = "sha256"
+install-updater = false
+publish-jobs = []
