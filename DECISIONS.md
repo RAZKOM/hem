@@ -122,6 +122,20 @@ needed. Items marked **review** deserve a look from the owner.
   sampling cap as the TUI.
 - A broken pipe (`| head`) exits 0 silently.
 
+## Releases
+
+- Distribution is GitHub Releases (cargo-dist) and crates.io only.
+- crates.io publishing lives in its own workflow (`publish.yml`), not in
+  cargo-dist's `release.yml`, so regenerating the dist workflow cannot drop
+  it. `dist-workspace.toml` keeps `publish-jobs = []` for the same reason.
+- Publishing uses crates.io Trusted Publishing (GitHub OIDC exchanged for a
+  short-lived token) instead of a stored `CARGO_REGISTRY_TOKEN` secret. The
+  job runs in the `crates-io` GitHub environment so required reviewers can
+  be added there later without touching the workflow.
+- The job refuses to publish when the tag does not match the `hem` version
+  in `Cargo.toml`, and skips crates whose version is already on crates.io,
+  so a partially failed run can simply be re-run.
+
 ## Platform notes
 
 - **Windows cannot truncate a memory-mapped file.** While hem has a file

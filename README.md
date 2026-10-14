@@ -246,9 +246,16 @@ clustering, timeline, merge), `crates/hem-tui` (ratatui app), `src/main.rs`
 (CLI, plain mode, `templates` subcommand), `tests/`, `benches/`, `testdata/`.
 Design notes and trade-offs are in [DECISIONS.md](DECISIONS.md).
 
-Releases: tag `v*` to run `.github/workflows/release.yml` (cargo-dist),
-which builds all six targets, uploads them to GitHub Releases and generates
-the shell / PowerShell installers.
+Releases: bump the version in `Cargo.toml`, commit, then push a `vX.Y.Z` tag.
+The tag runs two workflows:
+
+- `.github/workflows/release.yml` (cargo-dist) builds all six targets,
+  uploads them to GitHub Releases and generates the shell / PowerShell
+  installers.
+- `.github/workflows/publish.yml` runs the tests, then publishes `hem-core`,
+  `hem-tui` and `hem` to crates.io in that order through crates.io Trusted
+  Publishing (no token stored in the repository). Versions already on
+  crates.io are skipped, so re-running the workflow is safe.
 
 ## License
 
