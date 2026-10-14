@@ -3,7 +3,7 @@ members = ["crates/hem-core", "crates/hem-tui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/RAZKOM/hem"
@@ -11,8 +11,8 @@ authors = ["RAZKOM <269026521+RAZKOM@users.noreply.github.com>"]
 rust-version = "1.89"
 
 [workspace.dependencies]
-hem-core = { path = "crates/hem-core", version = "0.1.1" }
-hem-tui = { path = "crates/hem-tui", version = "0.1.1" }
+hem-core = { path = "crates/hem-core", version = "0.2.0" }
+hem-tui = { path = "crates/hem-tui", version = "0.2.0" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

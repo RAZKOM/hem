@@ -234,7 +234,8 @@ fn main() {
             emit(&mut w, &l, &mut written, &mut count);
             continue;
         }
-        if burst_left == 0 && rng.chance(1) {
+        // Roughly one burst every 20k lines, so spikes stand out.
+        if burst_left == 0 && rng.below(20_000) == 0 {
             burst_left = 50 + rng.below(400) as u32;
         }
         let level = if burst_left > 0 {

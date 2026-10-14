@@ -176,6 +176,7 @@ impl FieldPredicate {
     }
 
     pub fn matches(&self, line: &[u8], format: Format) -> bool {
+        let format = format.for_line(line);
         let Some(v) = fields::get(line, format, &self.key) else {
             return matches!(self.op, Op::Ne | Op::NotMatch) && !self.value.is_empty();
         };
@@ -221,11 +222,65 @@ fn cmp_eq(v: &str, want: &str, want_num: Option<f64>) -> bool {
     v.eq_ignore_ascii_case(want)
 }
 
-/// A template token: literal text or a wildcard.
+/// A template token.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
+    /// Literal text.
     Lit(String),
+    /// A `key=value` pair whose value varies, shown as `key=<*>`.
+    Key(String),
+    /// Anything.
     Wild,
+}
+
+/// The key of a `key=value` token, if it is one.
+pub fn key_of(tok: &str) -> Option<&str> {
+    let p = tok.find('=')?;
+    let key = &tok[..p];
+    let ok = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'@'));
+    ok.then_some(key)
+}
+
+impl Token {
+    /// Does a line token fit this template token?
+    pub fn accepts(&self, tok: &str) -> bool {
+        match self {
+            Token::Wild => true,
+            Token::Lit(s) => s == tok,
+            Token::Key(k) => key_of(tok) == Some(k.as_str()),
+        }
+    }
+
+    /// Does a line token match this one on something concrete (a literal
+    /// or a key)? Wildcards don't count.
+    pub fn matches_concretely(&self, tok: &str) -> bool {
+        !matches!(self, Token::Wild) && self.accepts(tok)
+    }
+
+    /// Loosen this token just enough to also accept `tok`.
+    pub fn generalise(&mut self, tok: &str) {
+        if self.accepts(tok) {
+            return;
+        }
+        *self = match self {
+            Token::Lit(s) => match (key_of(s), key_of(tok)) {
+                (Some(a), Some(b)) if a == b => Token::Key(a.to_string()),
+                _ => Token::Wild,
+            },
+            _ => Token::Wild,
+        };
+    }
+
+    pub fn display(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Token::Lit(s) => std::borrow::Cow::Borrowed(s),
+            Token::Key(k) => std::borrow::Cow::Owned(format!("{k}=<*>")),
+            Token::Wild => std::borrow::Cow::Borrowed("<*>"),
+        }
+    }
 }
 
 /// A mined template, usable as a filter.
@@ -237,14 +292,8 @@ pub struct TemplateMatch {
 
 impl TemplateMatch {
     pub fn display(&self) -> String {
-        let parts: Vec<&str> = self
-            .tokens
-            .iter()
-            .map(|t| match t {
-                Token::Lit(s) => s.as_str(),
-                Token::Wild => "<*>",
-            })
-            .collect();
+        let parts: Vec<std::borrow::Cow<'_, str>> =
+            self.tokens.iter().map(|t| t.display()).collect();
         parts.join(" ")
     }
 
@@ -253,10 +302,7 @@ impl TemplateMatch {
         if toks.len() != self.tokens.len() {
             return false;
         }
-        toks.iter().zip(&self.tokens).all(|(a, b)| match b {
-            Token::Wild => true,
-            Token::Lit(s) => a == s,
-        })
+        toks.iter().zip(&self.tokens).all(|(a, b)| b.accepts(a))
     }
 }
 

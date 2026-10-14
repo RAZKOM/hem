@@ -28,22 +28,29 @@ fn wait(cond: impl Fn() -> bool, max: Duration) -> Duration {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mmap = raw.iter().any(|a| a == "--mmap");
+    let mut args = raw.into_iter().filter(|a| a != "--mmap");
     let Some(path) = args.next() else {
-        eprintln!("usage: perf <file> [pattern]");
+        eprintln!("usage: perf <file> [pattern] [--mmap]");
         std::process::exit(2);
     };
     let pattern = args
         .next()
         .unwrap_or_else(|| "connection reset".to_string());
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    println!("file: {path} ({:.2} GB)", size as f64 / 1e9);
+    println!(
+        "file: {path} ({:.2} GB) · {}",
+        size as f64 / 1e9,
+        if mmap { "mmap" } else { "paged reads" }
+    );
 
     let t0 = Instant::now();
     let src = Source::open(
         &path,
         SourceOptions {
             follow: false,
+            mmap,
             ..Default::default()
         },
     )

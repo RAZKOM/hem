@@ -30,6 +30,25 @@ impl Format {
         }
     }
 
+    /// The format to use for one line of a source with this format. Mixed
+    /// files are common (a plain app log with the odd JSON or logfmt line
+    /// from a library), so a line that is clearly JSON or logfmt is treated
+    /// as such even when the source as a whole is plain or syslog.
+    pub fn for_line(self, line: &[u8]) -> Format {
+        match self {
+            Format::Plain | Format::Syslog => {
+                if looks_json(line) {
+                    Format::Json
+                } else if looks_logfmt(line) {
+                    Format::Logfmt
+                } else {
+                    self
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Whether this format exposes structured fields.
     pub fn has_fields(self) -> bool {
         matches!(
@@ -231,6 +250,20 @@ mod tests {
         let plain: Vec<&[u8]> = vec![b"2026-10-13 10:02:11 INFO hello", b"x=1"];
         assert_eq!(Format::detect(&plain), Format::Plain);
         assert_eq!(Format::detect(&[]), Format::Plain);
+    }
+
+    #[test]
+    fn per_line_refinement() {
+        assert_eq!(Format::Plain.for_line(br#"{"a":1}"#), Format::Json);
+        assert_eq!(
+            Format::Plain.for_line(b"ts=1 level=info msg=hi"),
+            Format::Logfmt
+        );
+        assert_eq!(
+            Format::Plain.for_line(b"2026-10-13 10:00:00 INFO user=bob x=1"),
+            Format::Plain
+        );
+        assert_eq!(Format::Nginx.for_line(br#"{"a":1}"#), Format::Nginx);
     }
 
     #[test]

@@ -518,7 +518,7 @@ fn detail(
     let theme = app.theme.clone();
     let t = app.tab();
     let raw = t.line_bytes(row);
-    let fmt = t.format_for(row.source());
+    let fmt = t.format_for(row.source()).for_line(&raw);
     let meta = t.meta_for(row, &raw);
     let width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();

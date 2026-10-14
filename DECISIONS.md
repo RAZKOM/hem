@@ -5,8 +5,21 @@ needed. Items marked **review** deserve a look from the owner.
 
 ## Architecture
 
+- **Files are read, not memory-mapped, by default.** Reads go through
+  `pread` / `seek_read` with a 16 MiB LRU of 64 KiB pages per file
+  (`paged.rs`); big sequential reads (indexing, view building, search)
+  bypass the cache. A mapping would stop other processes from truncating the
+  file on Windows and can SIGBUS on Unix when the file is truncated. The
+  cost: search over 5 GB takes ~1.2 s instead of ~0.4 s and the timeline
+  pass ~2.5 s instead of ~1.9 s; first screen, indexing and scrolling are
+  effectively unchanged. `--mmap` (`SourceOptions::mmap`) restores mapping
+  for static files. memmap2 stays a dependency for that opt-in.
+- **Chunks own or share their bytes.** `view::Chunk` holds one buffer per
+  source: shared for in-memory data (zero copy), or an owned copy for paged
+  files. Consecutive lines are read with one call; scattered filtered rows
+  go through the page cache. Source locks are released before any file I/O.
 - **One `Source` abstraction for files, stdin and gzip.** stdin and `.gz`
-  inputs are streamed into a temp file which is then memory-mapped and
+  inputs are streamed into a temp file which is then read (paged) and
   followed exactly like a growing file. This keeps a single indexing path
   and lets the UI show lines while decompression / piping is still running.
   Temp files live in the platform temp dir and are deleted on exit.
@@ -51,15 +64,24 @@ needed. Items marked **review** deserve a look from the owner.
   quoted strings and whitespace runs (`collapse::normalize`). Words made of
   hex letters only (`dead`, `cafe`) are kept. The 64-bit FNV hash of the
   normalised form is compared, never stored per line.
-- **Template mining is Drain with two tweaks**: lines are routed on the
-  first two *non-wildcard* tokens (timestamps at the start of a line would
-  otherwise be useless keys), and JSON / logfmt lines are clustered on their
-  `level + msg` field instead of the raw line (quoted strings are masked by
-  normalisation, which would otherwise fold every JSON line into one
-  template). Inputs larger than `defaults.cluster_cap` (2 M lines) are
-  sampled with a fixed stride and the UI / `hem templates` say so; counts are
-  scaled estimates. Known Drain limitation: a variable word in the first two
-  tokens (`User bob …` / `User alice …`) yields separate templates.
+- **Template mining is Drain with a few tweaks.**
+  - Lines are routed on the first four *non-wildcard* tokens (timestamps at
+    the start of a line would otherwise be useless keys), so different
+    messages land in different leaves.
+  - Similarity ignores positions that are wildcards on both sides, and a
+    line that fits a template exactly is a perfect match. Without this,
+    lines made mostly of variable parts each started their own template.
+  - `key=value` pairs keep their key when the value varies: templates show
+    `user=<*>`, not a bare `<*>`.
+  - JSON / logfmt lines are clustered on their `level + msg` field instead
+    of the raw line. This is decided per line (`Format::for_line`), so the
+    odd JSON or logfmt line inside a plain log is handled too; the same
+    per-line refinement drives field filters and the line detail view.
+  - Inputs larger than `defaults.cluster_cap` (2 M lines) are sampled with
+    a fixed stride and the UI / `hem templates` say so; counts are scaled
+    estimates.
+  - Known Drain limitation: a variable word among the first four literal
+    tokens (`User bob …` / `User alice …`) yields separate templates.
 - **Search runs over the view, not the file**, so results are row indices
   that `n`/`N` can binary-search. Identity views use a fast path: one
   `find_iter` over each chunk's contiguous bytes instead of one `is_match`
@@ -76,6 +98,16 @@ needed. Items marked **review** deserve a look from the owner.
 
 ## Terminal UI
 
+- **The minimap colours density, not presence.** Each row is a horizontal
+  bar (length = line count, log scale) coloured by the most severe level
+  that is unusually dense there: more than three standard deviations above
+  that level's average per row, or simply present when the level occurs
+  less than once per row on average. Plain "highest severity per bucket"
+  painted every row red as soon as errors were sprinkled through a log,
+  hiding the bursts the minimap exists to show.
+- **Repeat sparklines need timestamps.** A collapsed run is consecutive, so
+  without timestamps its members are evenly spread by construction and the
+  sparkline would always be a solid bar; such rows show only the `×N` badge.
 - **Scrolling is row-based**, not display-line based. With wrap on, a long
   top row shows from its first display line; `top` always points at a row.
   This keeps every scroll operation O(1) and avoids re-measuring rows.
@@ -135,23 +167,27 @@ needed. Items marked **review** deserve a look from the owner.
 - The job refuses to publish when the tag does not match the `hem` version
   in `Cargo.toml`, and skips crates whose version is already on crates.io,
   so a partially failed run can simply be re-run.
+- The README demo is a VHS tape (`docs/demo.tape`) rendered in CI on every
+  tag (`demo.yml`) and committed to `main` by `github-actions[bot]`, so the
+  GIF always matches the latest release. It renders on Linux with a
+  deterministic synthetic log from `examples/genlog.rs`. If `main` gets
+  branch protection, the job's direct push needs an exception (or switch it
+  to opening a pull request).
 
 ## Platform notes
 
-- **Windows cannot truncate a memory-mapped file.** While hem has a file
-  open, a writer that truncates it in place (`copytruncate` rotation) gets
-  "The requested operation cannot be performed on a file with a user-mapped
-  section open". Rename-based rotation works, and hem detects it via file
-  identity (`same-file`: volume + file index on Windows, dev + inode on
-  Unix). The in-place truncation test is Unix-only for this reason.
-  **review**: a `--no-mmap` mode (pread into a chunk cache) would remove
-  this limitation at some cost in simplicity.
-- On Unix, truncation of a mapped file can make the mapping fault
-  (SIGBUS) if a reader touches pages past the new end between the writer's
-  truncate and hem's next poll (≤ 250 ms). This is the standard mmap
-  trade-off and the same one `less` makes.
-- Deleting a file while hem has it open: Unix keeps showing the old inode;
-  Windows refuses the delete while mapped. Both are reported as a notice.
+- **Writers stay in control of their files.** With the default paged
+  reads, another process can truncate (`copytruncate` rotation), rename or
+  delete a file while hem has it open, on every platform; tests cover
+  truncate-then-append and delete on Windows. Reads past a new, shorter end
+  come back zero-filled until the follower's next poll (≤ 250 ms) notices
+  and re-indexes. Rotation by rename is detected via file identity
+  (`same-file`: volume + file index on Windows, dev + inode on Unix).
+- **With `--mmap` the old limits return:** Windows refuses to truncate a
+  file while hem maps it ("user-mapped section open"), and on Unix a
+  truncation can fault the mapping (SIGBUS) before the next poll.
+- Deleting a file while hem has it open: hem keeps showing what it already
+  indexed and reports the removal as a notice.
 
 ## Dependencies worth justifying
 
@@ -176,6 +212,5 @@ needed. Items marked **review** deserve a look from the owner.
   writer; the design (250 ms poll + notify, incremental index/view/search)
   is built for it. The 5 GB index runs at ~2.5 GB/s from page cache.
 - `--debug` logs actions and notices, not every event.
-- There is no asciinema recording yet (placeholder in the README).
 - Light theme and 16-colour degradation have been checked by eye in tests
   only (`TestBackend`), not on a wide range of real terminals.

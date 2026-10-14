@@ -1,0 +1,59 @@
+# Re-record docs/demo.gif from docs/demo.tape with VHS
+# (https://github.com/charmbracelet/vhs) and commit it to main.
+#
+# Runs on every version tag, so the README always shows the latest release,
+# and on demand from the Actions tab ("Run workflow").
+
+name: Demo recording
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # to commit the new GIF
+
+concurrency:
+  group: demo-recording
+  cancel-in-progress: true
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hem and the sample log
+        run: |
+          cargo build --release --bin hem --example genlog
+          ./target/release/examples/genlog --lines 200000 --out demo.log
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      - name: Record
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: docs/demo.tape
+
+      - name: Commit the recording to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp docs/demo.gif "$RUNNER_TEMP/demo.gif"
+          # A tag run is checked out at the tag; commit on top of main.
+          git fetch --depth=1 origin main
+          git checkout --force -B main FETCH_HEAD
+          cp "$RUNNER_TEMP/demo.gif" docs/demo.gif
+          git add docs/demo.gif
+          if git diff --cached --quiet; then
+            echo "Recording unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898399+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: update demo recording (${GITHUB_REF_NAME})"
+          git push origin main

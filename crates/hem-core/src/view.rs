@@ -19,6 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::collapse::shape_hash;
 use crate::filter::Filter;
 use crate::format::Format;
+use crate::index::trim_eol;
 use crate::level::Level;
 use crate::merge::Merged;
 use crate::parse::{parse_line, LineMeta};
@@ -66,15 +67,62 @@ impl Row {
     }
 }
 
+/// The bytes backing a chunk for one source.
+#[derive(Debug)]
+pub enum ChunkBuf {
+    /// Zero-copy: the source's in-memory data (mapped or owned). Spans are
+    /// absolute offsets into it.
+    Shared(Arc<Data>),
+    /// Bytes read out of a paged file. Spans index into this buffer.
+    Owned(Vec<u8>),
+}
+
+impl ChunkBuf {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            ChunkBuf::Shared(d) => d.as_slice().unwrap_or(&[]),
+            ChunkBuf::Owned(v) => v,
+        }
+    }
+}
+
 /// A batch of rows with their bytes, detached from the source locks.
 #[derive(Debug)]
 pub struct Chunk {
-    pub datas: Vec<Arc<Data>>,
+    /// One buffer per source, indexed by `row.source()`.
+    pub bufs: Vec<ChunkBuf>,
     pub rows: Vec<Row>,
-    /// `(start, len)` of each row's line within `datas[row.source()]`.
+    /// `(start, len)` of each row's line (terminator excluded) within
+    /// `bufs[row.source()]`.
     pub spans: Vec<(u64, u32)>,
     /// Index of the first row within the base.
     pub first: usize,
+}
+
+/// Position and length of a raw span `[s, e)` inside `bytes`, which start
+/// at file offset `base`, with the line terminator trimmed.
+fn trimmed(bytes: &[u8], base: u64, s: u64, e: u64) -> (u64, u32) {
+    let rel_s = (s.saturating_sub(base) as usize).min(bytes.len());
+    let rel_e = (e.saturating_sub(base) as usize).clamp(rel_s, bytes.len());
+    let len = trim_eol(&bytes[rel_s..rel_e]).len();
+    (rel_s as u64, len.min(u32::MAX as usize) as u32)
+}
+
+/// Load the bytes for a run of consecutive lines.
+fn load_contiguous(data: &Arc<Data>, raws: &[(u64, u64)]) -> (ChunkBuf, Vec<(u64, u32)>) {
+    if let Some(slice) = data.as_slice() {
+        let spans = raws.iter().map(|&(s, e)| trimmed(slice, 0, s, e)).collect();
+        return (ChunkBuf::Shared(Arc::clone(data)), spans);
+    }
+    let (Some(&(base, _)), Some(&(_, end))) = (raws.first(), raws.last()) else {
+        return (ChunkBuf::Owned(Vec::new()), Vec::new());
+    };
+    let bytes = data.read(base, end).into_owned();
+    let spans = raws
+        .iter()
+        .map(|&(s, e)| trimmed(&bytes, base, s, e))
+        .collect();
+    (ChunkBuf::Owned(bytes), spans)
 }
 
 impl Chunk {
@@ -88,8 +136,17 @@ impl Chunk {
 
     pub fn line(&self, i: usize) -> &[u8] {
         let (s, l) = self.spans[i];
-        let data = &self.datas[self.rows[i].source() as usize];
-        data.get(s as usize..(s + l as u64) as usize).unwrap_or(&[])
+        self.buf(self.rows[i].source())
+            .get(s as usize..(s + l as u64) as usize)
+            .unwrap_or(&[])
+    }
+
+    /// All bytes held for one source.
+    pub fn buf(&self, source: u8) -> &[u8] {
+        self.bufs
+            .get(source as usize)
+            .map(|b| b.bytes())
+            .unwrap_or(&[])
     }
 
     pub fn row(&self, i: usize) -> Row {
@@ -182,16 +239,22 @@ impl Base {
     pub fn chunk(&self, a: usize, b: usize) -> Chunk {
         match self {
             Base::Single(s) => {
-                let g = s.read();
-                let b = b.min(g.line_count());
-                let a = a.min(b);
-                let mut spans = Vec::with_capacity(b - a);
-                g.spans_into(a, b, &mut spans);
-                let rows = (a..a + spans.len())
+                // Copy what we need out of the index, then release the lock
+                // before touching the file.
+                let (a, raws, data) = {
+                    let g = s.read();
+                    let b = b.min(g.line_count());
+                    let a = a.min(b);
+                    let mut raws = Vec::with_capacity(b - a);
+                    g.raw_spans_into(a, b, &mut raws);
+                    (a, raws, g.data_arc())
+                };
+                let rows = (a..a + raws.len())
                     .map(|i| Row::new(i as u64, 0, 1))
                     .collect();
+                let (buf, spans) = load_contiguous(&data, &raws);
                 Chunk {
-                    datas: vec![g.data_arc()],
+                    bufs: vec![buf],
                     rows,
                     spans,
                     first: a,
@@ -207,30 +270,65 @@ impl Base {
     }
 
     /// Fetch arbitrary rows (e.g. a view's rows) with their bytes.
+    ///
+    /// For paged files, rows that are consecutive lines of the same source
+    /// are read with one call; scattered rows go through the page cache.
     pub fn fetch(&self, rows: &[Row]) -> Chunk {
         let sources = self.sources();
-        let guards: Vec<_> = sources.iter().map(|s| s.read()).collect();
-        let datas: Vec<Arc<Data>> = guards.iter().map(|g| g.data_arc()).collect();
-        let mut spans = Vec::with_capacity(rows.len());
-        let mut kept = Vec::with_capacity(rows.len());
-        for r in rows {
-            let Some(g) = guards.get(r.source() as usize) else {
+        // Raw spans and data handles, taken under the locks...
+        let (raws, datas) = {
+            let guards: Vec<_> = sources.iter().map(|s| s.read()).collect();
+            let raws: Vec<Option<(u64, u64)>> = rows
+                .iter()
+                .map(|r| {
+                    guards
+                        .get(r.source() as usize)
+                        .and_then(|g| g.raw_span(r.line() as usize))
+                })
+                .collect();
+            let datas: Vec<Arc<Data>> = guards.iter().map(|g| g.data_arc()).collect();
+            (raws, datas)
+        };
+        // ...then file reads without holding them.
+        let mut spans = vec![(0u64, 0u32); rows.len()];
+        let mut bufs = Vec::with_capacity(datas.len());
+        for (si, data) in datas.iter().enumerate() {
+            let mine: Vec<(usize, (u64, u64))> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.source() as usize == si)
+                .filter_map(|(k, _)| raws[k].map(|span| (k, span)))
+                .collect();
+            if let Some(slice) = data.as_slice() {
+                for &(k, (s, e)) in &mine {
+                    spans[k] = trimmed(slice, 0, s, e);
+                }
+                bufs.push(ChunkBuf::Shared(Arc::clone(data)));
                 continue;
-            };
-            match g.span(r.line() as usize) {
-                Some((s, e)) => {
-                    spans.push((s, (e - s) as u32));
-                    kept.push(*r);
-                }
-                None => {
-                    spans.push((0, 0));
-                    kept.push(*r);
-                }
             }
+            let mut arena: Vec<u8> = Vec::new();
+            let mut i = 0;
+            while i < mine.len() {
+                let (start, mut end) = mine[i].1;
+                let mut j = i + 1;
+                while j < mine.len() && mine[j].1 .0 == end {
+                    end = mine[j].1 .1;
+                    j += 1;
+                }
+                let bytes = data.read(start, end);
+                let offset = arena.len() as u64;
+                for &(k, (s, e)) in &mine[i..j] {
+                    let (rel, len) = trimmed(&bytes, start, s, e);
+                    spans[k] = (offset + rel, len);
+                }
+                arena.extend_from_slice(&bytes);
+                i = j;
+            }
+            bufs.push(ChunkBuf::Owned(arena));
         }
         Chunk {
-            datas,
-            rows: kept,
+            bufs,
+            rows: rows.to_vec(),
             spans,
             first: 0,
         }
@@ -240,17 +338,16 @@ impl Base {
     pub fn line_bytes(&self, row: Row) -> Option<Vec<u8>> {
         let s = self.source(row.source())?;
         let g = s.read();
-        g.line(row.line() as usize).map(|l| l.to_vec())
+        g.line(row.line() as usize).map(|l| l.into_owned())
     }
 
     /// Scan the last bytes of the (first) source for a timestamp, used to
     /// size the timeline before indexing completes.
     fn last_timestamp_hint(&self, default_year: i64) -> Option<i64> {
         let src = self.sources().into_iter().last()?;
-        let g = src.read();
-        let data = g.data();
-        let tail_start = data.len().saturating_sub(64 * 1024);
-        let tail = &data[tail_start..];
+        let data = src.read().data_arc();
+        let len = data.len();
+        let tail = data.read(len.saturating_sub(64 * 1024), len);
         let mut best = None;
         for line in tail.split(|&b| b == b'\n').rev().take(200) {
             if let Some(ts) = timestamp::find(line, default_year) {
@@ -266,7 +363,7 @@ impl Base {
             let g = src.read();
             for i in 0..g.line_count().min(200) {
                 if let Some(l) = g.line(i) {
-                    if let Some(ts) = timestamp::find(l, default_year) {
+                    if let Some(ts) = timestamp::find(&l, default_year) {
                         return Some(ts.ms);
                     }
                 }

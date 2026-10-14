@@ -17,7 +17,7 @@ use std::borrow::Cow;
 
 use crate::collapse::normalize;
 use crate::fields;
-use crate::filter::{TemplateMatch, Token};
+use crate::filter::{key_of, TemplateMatch, Token};
 use crate::format::Format;
 use crate::level::Level;
 use crate::parse::parse_line;
@@ -34,6 +34,7 @@ const MSG_KEYS: &[&str] = &["msg", "message", "event", "error", "err", "text", "
 /// values do not swallow the whole line.
 pub fn tokenize(line: &[u8], format: Format) -> Vec<String> {
     let line = &line[..line.len().min(4096)];
+    let format = format.for_line(line);
     let text: Cow<'_, [u8]> = match format {
         Format::Json | Format::Logfmt => {
             let msg = MSG_KEYS.iter().find_map(|k| match format {
@@ -63,7 +64,11 @@ fn tokenize_text(text: &[u8]) -> Vec<String> {
         .take(MAX_TOKENS)
         .map(|t| {
             if t.contains('#') {
-                "<*>".to_string()
+                // Keep the key of a key=value pair whose value is variable.
+                match key_of(t) {
+                    Some(k) if !k.contains('#') => format!("{k}=<*>"),
+                    _ => "<*>".to_string(),
+                }
             } else if t.len() > MAX_TOKEN_LEN {
                 let mut cut = MAX_TOKEN_LEN;
                 while !t.is_char_boundary(cut) {
@@ -157,7 +162,7 @@ impl Miner {
     pub fn new() -> Self {
         Self {
             sim_threshold: 0.5,
-            depth: 2,
+            depth: 4,
             max_children: 100,
             max_templates: 20_000,
             roots: HashMap::new(),
@@ -214,9 +219,30 @@ impl Miner {
                 .tokens
                 .iter()
                 .zip(tokens)
-                .filter(|(a, b)| matches!(a, Token::Lit(s) if s == *b))
+                .filter(|(a, b)| a.matches_concretely(b))
                 .count();
-            let sim = if n == 0 { 1.0 } else { same as f64 / n as f64 };
+            // Positions that are variable on both sides say nothing about
+            // whether the two lines share a shape; leave them out.
+            let both_wild = t
+                .tokens
+                .iter()
+                .zip(tokens)
+                .filter(|(a, b)| **a == Token::Wild && *b == "<*>")
+                .count();
+            let n = n - both_wild;
+            // A line that fits the template exactly (its wildcards line up
+            // with the template's) is a perfect match, even when it has few
+            // literal tokens. Otherwise lines made mostly of wildcards
+            // would each start a template of their own.
+            let exact = t.tokens.iter().zip(tokens).all(|(a, b)| match a {
+                Token::Wild => b == "<*>",
+                other => other.accepts(b),
+            });
+            let sim = if n == 0 || exact {
+                1.0
+            } else {
+                same as f64 / n as f64
+            };
             if best.map(|(_, b)| sim > b).unwrap_or(true) {
                 best = Some((id, sim));
             }
@@ -228,9 +254,7 @@ impl Miner {
             {
                 let t = &mut self.templates[id];
                 for (a, b) in t.tokens.iter_mut().zip(tokens) {
-                    if matches!(a, Token::Lit(s) if s != b) {
-                        *a = Token::Wild;
-                    }
+                    a.generalise(b);
                 }
                 id
             }
@@ -538,6 +562,12 @@ mod tests {
             b"User bob logged in from 10.0.0.1 (attempt 3)",
             Format::Plain,
         );
+        // A JSON line inside a plain file is clustered on its message.
+        let t2 = tokenize(
+            br#"{"level":"warn","msg":"slow query 12ms"}"#,
+            Format::Plain,
+        );
+        assert_eq!(t2, vec!["WARN", "slow", "query", "<*>"]);
         assert_eq!(
             t,
             vec!["User", "bob", "logged", "in", "from", "<*>", "(attempt", "<*>"]
@@ -582,6 +612,46 @@ mod tests {
             .matcher()
             .matches(b"2026-10-13 10:00:09 INFO login failed: user zed from 1.2.3.4"));
         assert_eq!(m.templates()[1].max_level(), Some(Level::Error));
+    }
+
+    #[test]
+    fn variable_words_merge_but_different_messages_do_not() {
+        let mut m = Miner::new();
+        let lines = [
+            "2026-10-13 10:00:01.1 FATAL [search] upstream timeout user=frank duration=3ms id=req-1a",
+            "2026-10-13 10:00:02.2 FATAL [search] upstream timeout user=dave duration=9ms id=req-2b",
+            "2026-10-13 10:00:03.3 FATAL [search] cache hit user=frank duration=1ms id=req-3c",
+        ];
+        for (i, l) in lines.iter().enumerate() {
+            m.add(
+                &tokenize(l.as_bytes(), Format::Plain),
+                Format::Plain,
+                Row::new(i as u64, 0, 1),
+                Some(Level::Fatal),
+                None,
+            );
+        }
+        let shown: Vec<String> = m.templates().iter().map(|t| t.display()).collect();
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown[0].contains("upstream timeout user=<*>"), "{shown:?}");
+        assert!(shown[1].contains("cache hit user=frank"), "{shown:?}");
+    }
+
+    #[test]
+    fn all_wildcard_lines_share_one_template() {
+        let mut m = Miner::new();
+        for i in 0..50u64 {
+            let line = format!("{} {}", 1000 + i, 0x5000 + i);
+            m.add(
+                &tokenize(line.as_bytes(), Format::Plain),
+                Format::Plain,
+                Row::new(i, 0, 1),
+                None,
+                None,
+            );
+        }
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.templates()[0].count, 50);
     }
 
     #[test]

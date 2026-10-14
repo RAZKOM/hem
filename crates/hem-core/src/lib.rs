@@ -16,6 +16,7 @@ pub mod format;
 pub mod index;
 pub mod level;
 pub mod merge;
+pub mod paged;
 pub mod par;
 pub mod parse;
 pub mod search;

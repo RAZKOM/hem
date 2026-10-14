@@ -131,6 +131,18 @@ impl LineIndex {
     }
 }
 
+/// Strip a trailing `\n` or `\r\n` from a raw line.
+pub fn trim_eol(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' {
+        end -= 1;
+        if end > 0 && line[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    &line[..end]
+}
+
 /// Scan a slice for line starts without touching an index.  Returns the
 /// absolute offsets (`base + position + 1`) of every newline in `data`.
 pub fn scan_offsets(data: &[u8], base: u64) -> Vec<u64> {

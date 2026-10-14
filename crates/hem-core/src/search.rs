@@ -152,9 +152,9 @@ fn scan_chunk(s: &Inner, a: usize, b: usize) -> Vec<u64> {
         return out;
     }
     let re = &s.matcher.regex;
-    if s.view.is_identity() && chunk.datas.len() == 1 {
+    if s.view.is_identity() && chunk.bufs.len() == 1 {
         // Fast path: one regex pass over the contiguous byte range.
-        let data = &chunk.datas[0];
+        let data = chunk.buf(0);
         let start = chunk.spans[0].0 as usize;
         let (ls, ll) = chunk.spans[chunk.len() - 1];
         let end = (ls + ll as u64) as usize;

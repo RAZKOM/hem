@@ -208,13 +208,17 @@ impl Tab {
             let g = src.read();
             let fmt = self.format_for(row.source());
             let year = self.view.default_year();
-            let rep = g.line(row.line() as usize).unwrap_or(&[]).to_vec();
+            let rep = g
+                .line(row.line() as usize)
+                .map(|l| l.into_owned())
+                .unwrap_or_default();
             let key = shape_hash(&rep);
             let mut l = row.line() as usize + 1;
             let mut scanned = 0usize;
             let n = g.line_count();
             while out.len() < want.min(MAX_EXPAND) && l < n && scanned < 200_000 {
                 if let Some(line) = g.line(l) {
+                    let line: &[u8] = &line;
                     let meta = parse_line(line, fmt, year);
                     if self.filter.matches(line, &meta, fmt) {
                         if shape_hash(line) == key {
@@ -246,17 +250,17 @@ impl Tab {
         let fmt = self.format_for(members[0].source());
         let year = self.view.default_year();
         let mut keys: Vec<i64> = Vec::with_capacity(members.len());
-        let mut carry = None;
         if let Some(src) = self.base.source(members[0].source()) {
             let g = src.read();
             for m in &members {
-                let line = g.line(m.line() as usize).unwrap_or(&[]);
-                let meta = parse_line(line, fmt, year);
-                if meta.ts.is_some() {
-                    carry = meta.ts;
+                let line = g.line(m.line() as usize).unwrap_or_default();
+                if let Some(ts) = parse_line(&line, fmt, year).ts {
+                    keys.push(ts);
                 }
-                keys.push(carry.unwrap_or(m.line() as i64));
             }
+        }
+        if keys.len() < 2 || keys.iter().all(|k| *k == keys[0]) {
+            return Vec::new();
         }
         let (min, max) = (
             keys.iter().copied().min().unwrap_or(0),

@@ -10,8 +10,13 @@
 obvious **where things went wrong** in a log, not just what the last lines
 say, and stays instant on multi-gigabyte files.
 
-- **Instant on huge files.** Memory-mapped, indexed in the background:
-  a 5 GB log is scrollable in ~13 ms and fully indexed in ~2 s.
+![hem jumping between errors, searching, filtering by level, opening a line's details, and listing the rarest log templates](docs/demo.gif)
+
+- **Instant on huge files.** Indexed in the background: a 5 GB log is
+  scrollable in ~15–25 ms and fully indexed in ~2–3 s.
+- **Never gets in the writer's way.** hem reads files without memory-mapping
+  them, so the program writing the log can still truncate, rotate or delete
+  it while hem is open, on Windows too.
 - **Answers "what happened?"** A timeline minimap coloured by severity,
   repeat collapsing with counts and sparklines, next/previous error, and a
   template view that surfaces rare lines.
@@ -215,14 +220,21 @@ page cache after generation.
 
 | | 1 GB (13.4 M lines) | 5 GB (67.2 M lines) |
 |---|---|---|
-| Open → first screen scrollable | 13 ms | 13 ms |
-| Full line index (background) | 0.40 s (2.7 GB/s) | 2.14 s (2.5 GB/s) |
+| Open → first screen scrollable | 27 ms | 13–25 ms |
+| Full line index (background) | 0.47 s (2.3 GB/s) | 1.7–3.0 s (1.8–3.1 GB/s) |
 | Index memory | 108 MB (8.0 B/line) | 537 MB (8.0 B/line) |
-| Timeline / statistics pass | 0.77 s | 3.9 s |
-| Regex search, first hit | 1.4 ms | 1.6 ms |
-| Regex search, complete | 0.06 s | 0.22 s |
-| Build collapsed view | 0.76 s | 3.8 s |
-| Jump anywhere + fetch a screen | < 0.01 ms | < 0.01 ms |
+| Timeline / statistics pass | 0.50 s | 2.5 s |
+| Regex search, first hit | 3.6 ms | 2.7 ms |
+| Regex search, complete | 0.20 s | 1.2 s |
+| Build collapsed view | 0.65 s | 3.5 s |
+| Jump anywhere + fetch a screen | 0.02 ms | 0.02 ms |
+
+These are the default paged reads. `--mmap` memory-maps instead: on the 5 GB
+file it finishes a search in 0.40 s instead of 1.2 s and the timeline pass in
+1.9 s instead of 2.5 s, but while it is mapped, other programs can't
+truncate the file on Windows, and a truncation can crash hem on Linux and
+macOS. Use it only for static files. `cargo run --release --example perf --
+<file> --mmap` compares the two.
 
 Cold-cache numbers are bounded by disk read speed (an NVMe SSD at ~3 GB/s
 indexes 5 GB in roughly 2–4 s). Redraws take well under a millisecond for a
@@ -256,6 +268,11 @@ The tag runs two workflows:
   `hem-tui` and `hem` to crates.io in that order through crates.io Trusted
   Publishing (no token stored in the repository). Versions already on
   crates.io are skipped, so re-running the workflow is safe.
+- `.github/workflows/demo.yml` builds the tagged version, re-records
+  `docs/demo.gif` from `docs/demo.tape` with
+  [VHS](https://github.com/charmbracelet/vhs) and commits it to `main`. It
+  can also be run by hand from the Actions tab. To change the demo, edit the
+  tape; to preview it locally, see the comment at the top of the tape.
 
 ## License
 

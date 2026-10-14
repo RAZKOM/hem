@@ -128,6 +128,13 @@ struct ViewArgs {
     /// Force colour output in plain mode even when piped.
     #[arg(long)]
     color: bool,
+
+    /// Memory-map files instead of reading them through a page cache.
+    /// Slightly faster on huge static files, but while hem runs, other
+    /// programs can't truncate the file on Windows, and a truncation can
+    /// crash hem on Linux/macOS. Leave it off for logs that are being written.
+    #[arg(long)]
+    mmap: bool,
 }
 
 fn main() -> ExitCode {
@@ -231,6 +238,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let source_opts = SourceOptions {
         follow: args.follow || !plain_mode,
         format: format_override,
+        mmap: args.mmap,
         ..Default::default()
     };
     let mut sources = Vec::new();

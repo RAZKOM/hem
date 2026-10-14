@@ -299,7 +299,21 @@ pub fn status(app: &mut App, frame: &mut Frame, area: Rect) {
         )]
     };
     let left_w: usize = left.iter().map(|s| s.content.width()).sum();
-    let right_w: usize = right.iter().map(|s| s.content.width()).sum();
+    let mut right = right;
+    let mut right_w: usize = right.iter().map(|s| s.content.width()).sum();
+    // Drop the right half rather than running the two together.
+    let show_right = left_w + right_w + 3 <= area.width as usize;
+    if !show_right {
+        if app.notices.is_empty() {
+            right.clear();
+        } else {
+            // A fresh notice matters more than the counters: show it alone.
+            left = vec![Span::raw(" ")];
+            left.append(&mut right);
+        }
+        right_w = 0;
+    }
+    let left_w: usize = left.iter().map(|s| s.content.width()).sum();
     let gap = (area.width as usize).saturating_sub(left_w + right_w + 1);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(gap)));
@@ -310,7 +324,7 @@ pub fn status(app: &mut App, frame: &mut Frame, area: Rect) {
     );
     // Right-side hints are clickable.
     let hx = area.x + (area.width as usize).saturating_sub(right_w + 1) as u16;
-    if app.notices.is_empty() && right_w + 1 < area.width as usize {
+    if show_right && app.notices.is_empty() && right_w + 1 < area.width as usize {
         app.hits.push((
             Rect {
                 x: hx,

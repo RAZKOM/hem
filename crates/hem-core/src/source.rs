@@ -1,14 +1,19 @@
-//! Sources: a memory-mapped file, stdin, a gzip stream or an in-memory
-//! buffer, plus the background thread that indexes it and follows growth.
+//! Sources: a file, stdin, a gzip stream or an in-memory buffer, plus the
+//! background thread that indexes it and follows growth.
+//!
+//! Files are read with positional reads through a page cache
+//! ([`crate::paged`]) so that other processes stay free to truncate, rotate
+//! or delete them. Memory mapping is available as an opt-in
+//! ([`SourceOptions::mmap`]) for static files.
 //!
 //! All readers go through [`Source::read`], which returns a guard holding a
 //! read lock on the current `(data, index)` pair.  The indexer thread only
 //! takes the write lock for very short windows (to append a batch of
-//! offsets or to swap in a bigger mapping), so the UI never stalls.
+//! offsets or to swap in a longer view of the file), so the UI never stalls.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -19,7 +24,8 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 use crate::error::{Error, Result};
 use crate::format::Format;
-use crate::index::{scan_offsets, LineIndex};
+use crate::index::{scan_offsets, trim_eol, LineIndex};
+use crate::paged::Paged;
 
 /// Chunk size for background scanning; each chunk becomes one batch of
 /// offsets appended under the write lock.
@@ -28,8 +34,12 @@ const SCAN_CHUNK: usize = 32 * 1024 * 1024;
 /// Raw bytes of a source.
 pub enum Data {
     Empty,
+    /// Opt-in memory mapping (`--mmap`).
     Mmap(memmap2::Mmap),
+    /// In-memory buffer (tests, pasted input).
     Vec(Vec<u8>),
+    /// Positional reads through a page cache (the default for files).
+    Paged(Paged),
 }
 
 impl std::fmt::Debug for Data {
@@ -38,13 +48,43 @@ impl std::fmt::Debug for Data {
     }
 }
 
-impl Deref for Data {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
+impl Data {
+    /// Length in bytes.
+    pub fn len(&self) -> u64 {
         match self {
-            Data::Empty => &[],
-            Data::Mmap(m) => m,
-            Data::Vec(v) => v,
+            Data::Empty => 0,
+            Data::Mmap(m) => m.len() as u64,
+            Data::Vec(v) => v.len() as u64,
+            Data::Paged(p) => p.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The whole buffer as one slice, when it lives in memory (mapped or
+    /// owned). `None` for paged files.
+    pub fn as_slice(&self) -> Option<&[u8]> {
+        match self {
+            Data::Empty => Some(&[]),
+            Data::Mmap(m) => Some(m),
+            Data::Vec(v) => Some(v),
+            Data::Paged(_) => None,
+        }
+    }
+
+    /// Bytes `[start, end)`, clamped to the buffer. Borrowed for in-memory
+    /// data, read from disk for paged files.
+    pub fn read(&self, start: u64, end: u64) -> Cow<'_, [u8]> {
+        match self {
+            Data::Paged(p) => Cow::Owned(p.read(start, end)),
+            other => {
+                let s = other.as_slice().unwrap_or(&[]);
+                let end = (end as usize).min(s.len());
+                let start = (start as usize).min(end);
+                Cow::Borrowed(&s[start..end])
+            }
         }
     }
 }
@@ -68,6 +108,11 @@ pub struct SourceOptions {
     pub poll_interval: Duration,
     /// Force a line format instead of auto-detecting.
     pub format: Option<Format>,
+    /// Memory-map files instead of reading them through the page cache.
+    /// Slightly faster on static files, but while hem has the file mapped,
+    /// Windows refuses to let other processes truncate it, and on Unix a
+    /// truncation by another process can crash hem (SIGBUS).
+    pub mmap: bool,
 }
 
 impl Default for SourceOptions {
@@ -76,6 +121,7 @@ impl Default for SourceOptions {
             follow: true,
             poll_interval: Duration::from_millis(250),
             format: None,
+            mmap: false,
         }
     }
 }
@@ -124,6 +170,7 @@ struct Inner {
     format_override: Option<Format>,
     format: Mutex<Option<Format>>,
     follow: bool,
+    mmap: bool,
     _temp: Mutex<Option<tempfile::NamedTempFile>>,
 }
 
@@ -152,7 +199,8 @@ impl std::fmt::Debug for SourceGuard<'_> {
 }
 
 impl SourceGuard<'_> {
-    pub fn data(&self) -> &[u8] {
+    /// The current data buffer.
+    pub fn data(&self) -> &Data {
         &self.guard.data
     }
 
@@ -182,31 +230,37 @@ impl SourceGuard<'_> {
         self.guard.index.line_count()
     }
 
-    /// Raw bytes of line `i` without its terminator.
-    pub fn line(&self, i: usize) -> Option<&[u8]> {
-        let data = &self.guard.data;
-        let (s, e) = self.guard.index.span(i, data)?;
-        data.get(s as usize..e as usize)
+    /// Bytes of line `i` without its terminator.
+    pub fn line(&self, i: usize) -> Option<Cow<'_, [u8]>> {
+        let (s, e) = self.guard.index.raw_span(i)?;
+        Some(match self.guard.data.read(s, e) {
+            Cow::Borrowed(b) => Cow::Borrowed(trim_eol(b)),
+            Cow::Owned(mut v) => {
+                let n = trim_eol(&v).len();
+                v.truncate(n);
+                Cow::Owned(v)
+            }
+        })
     }
 
-    /// Byte span of line `i` (without terminator).
-    pub fn span(&self, i: usize) -> Option<(u64, u64)> {
-        self.guard.index.span(i, &self.guard.data)
+    /// Byte span `[start, end)` of line `i`, *including* its terminator.
+    pub fn raw_span(&self, i: usize) -> Option<(u64, u64)> {
+        self.guard.index.raw_span(i)
     }
 
     pub fn line_at_offset(&self, offset: u64) -> usize {
         self.guard.index.line_at(offset)
     }
 
-    /// Push `(start, len)` spans (without terminators) for lines `a..b`.
-    pub fn spans_into(&self, a: usize, b: usize, out: &mut Vec<(u64, u32)>) {
-        let data = &self.guard.data;
+    /// Push raw `(start, end)` spans (terminators included) for lines
+    /// `a..b`. No file access is needed: spans come from the index alone.
+    pub fn raw_spans_into(&self, a: usize, b: usize, out: &mut Vec<(u64, u64)>) {
         let idx = &self.guard.index;
         let b = b.min(idx.line_count());
         out.reserve(b.saturating_sub(a));
         for i in a..b {
-            if let Some((s, e)) = idx.span(i, data) {
-                out.push((s, (e - s) as u32));
+            if let Some(span) = idx.raw_span(i) {
+                out.push(span);
             }
         }
     }
@@ -374,8 +428,8 @@ impl Source {
         let mut st = self.0.state.write();
         let mut v = match Arc::try_unwrap(std::mem::replace(&mut st.data, Arc::new(Data::Empty))) {
             Ok(Data::Vec(v)) => v,
-            Ok(other) => other.to_vec(),
-            Err(arc) => arc.to_vec(),
+            Ok(other) => other.read(0, other.len()).into_owned(),
+            Err(arc) => arc.read(0, arc.len()).into_owned(),
         };
         v.extend_from_slice(bytes);
         st.index.extend_from(&v);
@@ -495,7 +549,8 @@ impl Source {
         if n == 0 {
             return Format::Plain;
         }
-        let sample: Vec<&[u8]> = (0..n.min(200)).filter_map(|i| guard.line(i)).collect();
+        let owned: Vec<Cow<'_, [u8]>> = (0..n.min(200)).filter_map(|i| guard.line(i)).collect();
+        let sample: Vec<&[u8]> = owned.iter().map(|l| l.as_ref()).collect();
         let f = Format::detect(&sample);
         // Only cache once we have a decent sample or the input is finished.
         if n >= 20 || self.is_complete() {
@@ -544,6 +599,7 @@ impl Inner {
             format_override: opts.format,
             format: Mutex::new(None),
             follow: opts.follow,
+            mmap: opts.mmap && kind == SourceKind::File,
             _temp: Mutex::new(None),
         }
     }
@@ -645,7 +701,7 @@ fn follower_main(
         None
     };
     let mut file = match File::open(&path) {
-        Ok(f) => f,
+        Ok(f) => Arc::new(f),
         Err(e) => {
             inner.push_notice(Notice::Error(format!("open {}: {e}", path.display())));
             inner.stats.complete.store(true, Ordering::Release);
@@ -653,7 +709,11 @@ fn follower_main(
         }
     };
     let mut identity = identity_of_path(&path);
-    let mut mapped_len: u64 = 0;
+    // Length of the current `Data` view of the file.
+    let mut data_len: u64 = 0;
+    // Shared handle + page cache for paged reads; replaced on reset.
+    let mut paged: Option<Paged> = None;
+    let mut scan_buf: Vec<u8> = Vec::new();
     let mut missing_reported = false;
     let mut shrunk = false;
     let mut last_progress = Instant::now();
@@ -676,9 +736,10 @@ fn follower_main(
                 Some(now) => {
                     if identity.as_ref() != Some(&now) {
                         if let Ok(nf) = File::open(&path) {
-                            file = nf;
+                            file = Arc::new(nf);
                             identity = Some(now);
-                            mapped_len = 0;
+                            data_len = 0;
+                            paged = None;
                             inner.reset(Notice::Rotated);
                             continue;
                         }
@@ -706,36 +767,59 @@ fn follower_main(
         let scanned = inner.state.read().index.scanned();
 
         if len < scanned {
-            mapped_len = 0;
+            data_len = 0;
+            paged = None;
             inner.reset(Notice::Truncated);
             continue;
         }
 
         if len > scanned {
             inner.stats.complete.store(false, Ordering::Release);
-            if len > mapped_len {
-                match map_file(&file, len) {
-                    Ok(data) => {
-                        let mut st = inner.state.write();
-                        st.data = Arc::new(data);
-                        mapped_len = len;
+            if len > data_len {
+                let data = if inner.mmap {
+                    match map_file(&file, len) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            inner.push_notice(Notice::Error(format!("mmap: {e}")));
+                            inner.stats.complete.store(true, Ordering::Release);
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        inner.push_notice(Notice::Error(format!("mmap: {e}")));
-                        inner.stats.complete.store(true, Ordering::Release);
-                        break;
-                    }
-                }
+                } else {
+                    let p = match &paged {
+                        Some(p) => p.with_len(len),
+                        None => Paged::new(Arc::clone(&file), len),
+                    };
+                    paged = Some(p.clone());
+                    Data::Paged(p)
+                };
+                inner.state.write().data = Arc::new(data);
+                data_len = len;
             }
             let data = inner.state.read().data.clone();
             let mut from = scanned as usize;
-            let to = mapped_len as usize;
+            let to = data_len as usize;
             while from < to {
                 if inner.stop.load(Ordering::Acquire) {
                     return;
                 }
-                let end = (from + SCAN_CHUNK).min(to);
-                let offsets = scan_offsets(&data[from..end], from as u64);
+                let mut end = (from + SCAN_CHUNK).min(to);
+                let offsets = match (data.as_slice(), &*data) {
+                    (Some(slice), _) => scan_offsets(&slice[from..end], from as u64),
+                    (None, Data::Paged(p)) => {
+                        scan_buf.resize(end - from, 0);
+                        let got = p.read_into(from as u64, &mut scan_buf).unwrap_or(0);
+                        if got == 0 {
+                            // The file shrank under us; the next poll
+                            // detects the truncation and re-indexes.
+                            std::thread::sleep(opts.poll_interval);
+                            break;
+                        }
+                        end = from + got;
+                        scan_offsets(&scan_buf[..got], from as u64)
+                    }
+                    (None, _) => break,
+                };
                 {
                     let mut st = inner.state.write();
                     st.index.append_offsets(&offsets, end as u64);
@@ -753,6 +837,9 @@ fn follower_main(
                     inner.wake();
                     last_progress = Instant::now();
                 }
+            }
+            if scan_buf.capacity() > SCAN_CHUNK {
+                scan_buf = Vec::new();
             }
             inner.wake();
             continue;
@@ -812,9 +899,9 @@ mod tests {
         let src = Source::from_bytes("mem", b"one\ntwo\r\nthree".to_vec());
         let g = src.read();
         assert_eq!(g.line_count(), 3);
-        assert_eq!(g.line(0), Some(&b"one"[..]));
-        assert_eq!(g.line(1), Some(&b"two"[..]));
-        assert_eq!(g.line(2), Some(&b"three"[..]));
+        assert_eq!(g.line(0).as_deref(), Some(&b"one"[..]));
+        assert_eq!(g.line(1).as_deref(), Some(&b"two"[..]));
+        assert_eq!(g.line(2).as_deref(), Some(&b"three"[..]));
         assert_eq!(g.line(3), None);
     }
 
@@ -842,14 +929,14 @@ mod tests {
         }
         src.poke();
         wait_for(&src, |s| s.line_count() == 3);
-        assert_eq!(src.read().line(2), Some(&b"third"[..]));
+        assert_eq!(src.read().line(2).as_deref(), Some(&b"third"[..]));
         src.stop();
     }
 
-    /// Windows refuses to truncate a file that has a user-mapped section
-    /// open, so in-place truncation can only be exercised on Unix.
+    /// In-place truncation (`copytruncate` rotation). With paged reads this
+    /// works on every platform, including Windows, where a memory mapping
+    /// would make the writer's truncate fail.
     #[test]
-    #[cfg(unix)]
     fn truncation_resets_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.log");
@@ -872,7 +959,7 @@ mod tests {
         }
         src.poke();
         wait_for(&src, |s| s.generation() != gen0 && s.line_count() == 1);
-        assert_eq!(src.read().line(0), Some(&b"x"[..]));
+        assert_eq!(src.read().line(0).as_deref(), Some(&b"x"[..]));
         assert!(src.take_notices().contains(&Notice::Truncated));
         src.stop();
     }
@@ -894,10 +981,69 @@ mod tests {
         std::fs::write(&path, "new1\n").unwrap();
         src.poke();
         wait_for(&src, |s| s.generation() != gen0 && s.line_count() == 1);
-        assert_eq!(src.read().line(0), Some(&b"new1"[..]));
+        assert_eq!(src.read().line(0).as_deref(), Some(&b"new1"[..]));
         let notices = src.take_notices();
         assert!(notices.contains(&Notice::Rotated), "{notices:?}");
         src.stop();
+    }
+
+    /// While hem has a file open, the writer must still be able to
+    /// truncate it, keep writing, and finally delete it.
+    #[test]
+    fn writer_can_truncate_and_delete_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+        let opts = SourceOptions {
+            poll_interval: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let src = Source::open(&path, opts).unwrap();
+        wait_for(&src, |s| s.is_complete() && s.line_count() == 3);
+        // Hold a read guard (as the UI does while drawing) during the write.
+        {
+            let _g = src.read();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(0)
+                .expect("truncate while hem has the file open");
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"after\n")
+            .unwrap();
+        src.poke();
+        wait_for(&src, |s| {
+            s.line_count() == 1 && s.read().line(0).as_deref() == Some(&b"after"[..])
+        });
+        std::fs::remove_file(&path).expect("delete while hem has the file open");
+        src.stop();
+    }
+
+    #[test]
+    fn mmap_opt_in_reads_the_same_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.log");
+        std::fs::write(&path, "a\r\nbb\nccc").unwrap();
+        for mmap in [false, true] {
+            let opts = SourceOptions {
+                follow: false,
+                mmap,
+                ..Default::default()
+            };
+            let src = Source::open(&path, opts).unwrap();
+            wait_for(&src, |s| s.is_complete());
+            let g = src.read();
+            assert_eq!(g.data().as_slice().is_some(), mmap);
+            let lines: Vec<Vec<u8>> = (0..g.line_count())
+                .map(|i| g.line(i).unwrap().into_owned())
+                .collect();
+            assert_eq!(lines, vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()]);
+        }
     }
 
     #[test]
