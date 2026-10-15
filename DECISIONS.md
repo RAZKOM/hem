@@ -108,6 +108,23 @@ needed. Items marked **review** deserve a look from the owner.
 - **Repeat sparklines need timestamps.** A collapsed run is consecutive, so
   without timestamps its members are evenly spread by construction and the
   sparkline would always be a solid bar; such rows show only the `×N` badge.
+- **Pins are sticky.** A pinned line is shown in a strip above the log (up
+  to five, then "N more"), marked on the minimap, and reachable with `]` /
+  `[`. Pins are stored as `(source, line)`, so they survive filter changes;
+  a pin the filters hide stays in the strip, dimmed and marked "filtered
+  out". Positions in the view are resolved on each tick: a binary search
+  for single-source views, an incremental scan (2 M rows per tick) for
+  merged ones, whose rows are ordered by time rather than line.
+- **Field columns are sampled once per view**, from ~200 rows at the
+  current position plus ~200 spread over the view, and kept until the
+  filters change. Columns used to be re-derived from whatever rows were on
+  screen, so they changed while scrolling and had no header. A column is a
+  key present in at least a fifth of the sampled structured lines, as wide
+  as 90 % of its values (max 32); timestamp and level come first and the
+  message last and unpadded. Timestamp, level and message aliases (`time` /
+  `ts`, `msg` / `message`, …) share a column so merged sources line up.
+  Collapsed runs get a fixed-width count column instead of a badge, which
+  would shift the cells.
 - **Scrolling is row-based**, not display-line based. With wrap on, a long
   top row shows from its first display line; `top` always points at a row.
   This keeps every scroll operation O(1) and avoids re-measuring rows.

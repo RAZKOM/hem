@@ -77,11 +77,12 @@ The defaults (all configurable, see [Configuration](#configuration)):
 | `x` | expand / collapse a repeated run inline |
 | `t` | templates view (`s` sort column, `r` reverse, `/` filter, `Enter` show occurrences) |
 | `Enter` | line detail (pretty JSON, fields, context; `Tab` picks a field, `*` highlights its value) |
-| `p` | pin / unpin line |
+| `p` | pin / unpin line: pinned lines stay in a strip above the log and show as `◆` on the minimap |
+| `]` / `[` | next / previous pinned line (wraps around) |
 | `*` | highlight all lines containing a value (request id, thread, trace id…) |
 | `y` / `Y` | copy line / copy visible lines (system clipboard, OSC 52 over SSH) |
 | `w` | toggle wrap |
-| `C` | toggle field columns (JSON / logfmt) |
+| `C` | toggle field columns (JSON / logfmt): a table with a header row; `←` / `→` scroll sideways |
 | `T` | cycle timestamp display (original, time, iso, local, relative) |
 | `Tab` / `Shift+Tab` | switch source tabs · `S` source picker · `o` open a file |
 | `L` | go to line / percentage / time (`1234`, `50%`, `10:30`, `2026-10-13T10:30:00Z`, `15m`) |
@@ -91,10 +92,13 @@ The defaults (all configurable, see [Configuration](#configuration)):
 | `q` / `Esc` | close modal / leave templates view / quit |
 
 Everything is clickable too: tabs, filter chips (click ✕ to remove one),
-rows (click to select, click again for detail), the minimap (click or drag
-to jump), the scrollbar, modal items and buttons.
+rows (click to select, click again for detail), pinned lines (click to jump),
+the minimap (click or drag to jump), the scrollbar, modal items and buttons.
 
 ## Filters
+
+The full guide, with examples and a workflow for incidents spanning many
+files, is in [docs/filtering.md](docs/filtering.md). The short version:
 
 Filters compose: every include pattern must match, no exclude pattern may
 match, the level must be at or above the threshold, the timestamp must be in
@@ -179,7 +183,8 @@ quit = "ctrl+q"
 # actions: scroll_up scroll_down scroll_left scroll_right page_up page_down half_page_up
 #   half_page_down top bottom toggle_follow search next_match prev_match clear_search filter
 #   exclude field_filter filter_editor clear_filters cycle_level next_error prev_error
-#   toggle_collapse expand templates detail pin highlight_value clear_highlight copy copy_view
+#   toggle_collapse expand templates detail pin next_pin prev_pin clear_pins highlight_value
+#   clear_highlight copy copy_view
 #   toggle_wrap toggle_columns cycle_timestamp next_tab prev_tab sources open_file goto palette
 #   settings help close quit sort_templates sort_templates_reverse refresh
 

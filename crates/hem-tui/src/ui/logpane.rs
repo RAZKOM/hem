@@ -14,7 +14,8 @@ use hem_core::view::Row;
 
 use super::line::{match_ranges, segments, Kind};
 use super::widgets::{clip_spans, group, wrap_spans};
-use crate::app::{App, Hit, MAX_EXPAND};
+use crate::app::{App, ColumnLayout, Hit, PinPos, MAX_EXPAND};
+use crate::keymap::Action;
 use crate::theme::Theme;
 
 const SPARK: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -126,23 +127,215 @@ pub fn line_spans(
     spans
 }
 
-/// Column layout for field-column mode: first N keys of the top line.
-fn column_keys(app: &App, rows: &[Row]) -> Vec<String> {
+/// Most pinned lines shown in the strip above the log.
+pub const MAX_PIN_STRIP: usize = 5;
+
+/// Width of the source-name column in merged views.
+const SOURCE_TAG_W: usize = 11;
+
+/// Height of the pinned strip (pinned lines plus a divider) for a log
+/// column `height` rows tall; 0 when nothing is pinned or space is short.
+pub fn pin_strip_height(app: &App, height: u16) -> u16 {
+    let pins = app.tab().pins.len();
+    if pins == 0 || height < 8 {
+        return 0;
+    }
+    let room = (height as usize / 3).saturating_sub(1).max(1);
+    (pins.min(MAX_PIN_STRIP).min(room) + 1) as u16
+}
+
+/// Is the column header shown for the active tab?
+pub fn column_header_visible(app: &App) -> bool {
     let t = app.tab();
-    for r in rows.iter().take(5) {
-        let line = t.line_bytes(*r);
-        let fmt = t.format_for(r.source());
-        if !fmt.has_fields() {
+    t.columns && t.col_layout.as_ref().is_some_and(|l| !l.keys.is_empty())
+}
+
+/// The source-name column for merged views.
+fn source_tag(app: &App, row: Row, theme: &Theme) -> Span<'static> {
+    let name = app
+        .tab()
+        .base
+        .source(row.source())
+        .map(|s| s.name().to_string())
+        .unwrap_or_default();
+    let tag: String = name.chars().take(SOURCE_TAG_W - 1).collect();
+    Span::styled(
+        format!("{tag:<w$} ", w = SOURCE_TAG_W - 1),
+        theme.source_style(row.source() as usize),
+    )
+}
+
+/// Draw the pinned strip: pinned lines stay on screen however far the log
+/// scrolls.  Click one to jump to it.
+pub fn pins(app: &mut App, frame: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let theme = app.theme.clone();
+    let ascii = app.ascii;
+    let width = area.width as usize;
+    let shown = area.height as usize - 1;
+    let (origin, year) = {
+        let t = app.tab();
+        (t.view.stats().ts_min, t.view.default_year())
+    };
+    let merged = app.tab().base.is_merged() && app.tab().base.sources().len() > 1;
+    let order = app.tab().pins_in_order();
+    let cursor = app.tab().cursor;
+    let highlight_re = app.tab().highlight.as_ref().map(|m| m.regex.clone());
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    let mut hidden = 0usize;
+    for (k, &(idx, pos)) in order.iter().enumerate() {
+        if pos == PinPos::Hidden {
+            hidden += 1;
+        }
+        if k >= shown {
             continue;
         }
-        let fields = hem_core::fields::extract(&line, fmt);
-        if !fields.is_empty() {
-            let mut keys: Vec<String> = fields.into_iter().map(|(k, _)| k).collect();
-            keys.truncate(8);
-            return keys;
+        let (src, line) = app.tab().pins[idx];
+        let row = Row::new(line, src, 1);
+        let raw = app.tab().line_bytes(row);
+        let fmt = app.tab().format_for(src);
+        let meta = app.tab().meta_for(row, &raw);
+        let (text, meta2) = display_text(&raw, &meta, fmt, app.ts_display, origin, year);
+        let at_cursor = pos == PinPos::Row(cursor);
+        let mut spans = vec![Span::styled(
+            if ascii { "*" } else { "▍" },
+            theme.fg_style(theme.pin).add_modifier(Modifier::BOLD),
+        )];
+        if merged {
+            spans.push(source_tag(app, row, &theme));
         }
+        spans.push(Span::styled(
+            format!("{:>8} ", group(line + 1)),
+            theme.fg_style(theme.pin),
+        ));
+        let body = line_spans(
+            &theme,
+            &text,
+            &meta2,
+            fmt,
+            None,
+            false,
+            highlight_re.as_ref(),
+        );
+        if pos == PinPos::Hidden {
+            spans.push(Span::styled("filtered out ", theme.dim_style()));
+            spans.extend(body.into_iter().map(|s| {
+                let c = s.content.into_owned();
+                Span::styled(c, theme.dim_style())
+            }));
+        } else {
+            spans.extend(body);
+        }
+        let style = if at_cursor {
+            theme.selection()
+        } else if theme.is_mono() {
+            Style::default()
+        } else {
+            Style::default().bg(theme.muted_bg)
+        };
+        lines.push(Line::from(clip_spans(spans, 0, width)).style(style));
+        app.hits.push((
+            Rect {
+                x: area.x,
+                y: area.y + k as u16,
+                width: area.width,
+                height: 1,
+            },
+            Hit::Pin(idx),
+        ));
     }
-    Vec::new()
+    // Divider with a legend.
+    let mut legend = format!(
+        " {} pinned · {} / {} jump · {} unpin ",
+        order.len(),
+        app.keymap.keys_label(Action::NextPin, ascii),
+        app.keymap.keys_label(Action::PrevPin, ascii),
+        app.keymap.keys_label(Action::Pin, ascii),
+    );
+    if order.len() > shown {
+        legend.push_str(&format!("· {} more not shown ", order.len() - shown));
+    }
+    if hidden > 0 {
+        legend.push_str(&format!("· {hidden} filtered out "));
+    }
+    let rule = if ascii { "-" } else { "─" };
+    let legend = super::widgets::fit(&legend, width.saturating_sub(2), ascii);
+    let fill = width.saturating_sub(2 + legend.width());
+    lines.push(Line::from(vec![
+        Span::styled(rule.repeat(2), theme.fg_style(theme.border)),
+        Span::styled(legend, theme.fg_style(theme.pin)),
+        Span::styled(rule.repeat(fill), theme.fg_style(theme.border)),
+    ]));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Width of the row prefix in column mode, so the header lines up.
+fn column_prefix_width(merged: bool, layout: &ColumnLayout) -> usize {
+    1 + if merged { SOURCE_TAG_W } else { 0 }
+        + if layout.count_w > 0 {
+            layout.count_w + 1
+        } else {
+            0
+        }
+}
+
+/// Draw the field-column header (key names), scrolled with the rows.
+pub fn column_header(app: &mut App, frame: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let theme = app.theme.clone();
+    let ascii = app.ascii;
+    let t = app.tab();
+    let Some(layout) = t.col_layout.clone() else {
+        return;
+    };
+    let merged = t.base.is_merged() && t.base.sources().len() > 1;
+    let hscroll = t.hscroll;
+    let style = theme.fg_style(theme.json_key).add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ")];
+    if merged {
+        spans.push(Span::styled(
+            format!("{:<w$}", "source", w = SOURCE_TAG_W),
+            style,
+        ));
+    }
+    if layout.count_w > 0 {
+        spans.push(Span::styled(
+            format!("{:>w$} ", "count", w = layout.count_w),
+            style,
+        ));
+    }
+    debug_assert_eq!(
+        spans.iter().map(|s| s.content.width()).sum::<usize>(),
+        column_prefix_width(merged, &layout)
+    );
+    for (k, w) in layout.keys.iter().zip(&layout.widths) {
+        let cell = if *w == 0 {
+            k.clone()
+        } else {
+            super::widgets::pad(k, *w, ascii)
+        };
+        spans.push(Span::styled(format!("{cell} "), style));
+    }
+    let mut spans = clip_spans(spans, hscroll, area.width as usize);
+    if hscroll > 0 {
+        // Show that the table is scrolled sideways.
+        let arrow = if ascii { "<" } else { "◂" };
+        if let Some(first) = spans.first_mut() {
+            let rest: String = first.content.chars().skip(1).collect();
+            *first = Span::styled(rest, first.style);
+        }
+        spans.insert(0, Span::styled(arrow, theme.accent_style()));
+    }
+    let bg = if theme.is_mono() {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().bg(theme.muted_bg)
+    };
+    frame.render_widget(Paragraph::new(Line::from(spans).style(bg)), area);
 }
 
 /// Draw the log pane.
@@ -215,10 +408,10 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let top = top.min(n - 1);
     let rows = app.tab().view.rows(top, (top + height).min(n));
-    let col_keys = if columns {
-        column_keys(app, &rows)
+    let layout: Option<ColumnLayout> = if columns {
+        app.tab().col_layout.clone().filter(|l| !l.keys.is_empty())
     } else {
-        Vec::new()
+        None
     };
     let chunk = app.tab().view.chunk(top, (top + height).min(n));
 
@@ -252,19 +445,28 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
             theme.fg_style(theme.pin),
         ));
         if merged && src_count > 1 {
-            let name = app
-                .tab()
-                .base
-                .source(row.source())
-                .map(|s| s.name().to_string())
-                .unwrap_or_default();
-            let tag: String = name.chars().take(10).collect();
-            prefix.push(Span::styled(
-                format!("{tag:<10} "),
-                theme.source_style(row.source() as usize),
-            ));
+            prefix.push(source_tag(app, *row, &theme));
         }
-        if row.count() > 1 {
+        // Column mode: structured rows get a fixed-width prefix so every
+        // cell lines up under the header.
+        let col_layout = layout.as_ref().filter(|_| fmt.has_fields());
+        if let Some(l) = col_layout {
+            if l.count_w > 0 {
+                let badge = if row.count() > 1 {
+                    format!(
+                        "{}{}",
+                        if ascii { "x" } else { "×" },
+                        group(row.count() as u64)
+                    )
+                } else {
+                    String::new()
+                };
+                prefix.push(Span::styled(
+                    format!("{badge:>w$} ", w = l.count_w),
+                    theme.fg_style(theme.badge).add_modifier(Modifier::BOLD),
+                ));
+            }
+        } else if row.count() > 1 {
             let badge = if ascii {
                 format!("x{} ", group(row.count() as u64))
             } else {
@@ -295,8 +497,17 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
             prefix.push(Span::styled(arrow, theme.dim_style()));
         }
 
-        let body: Vec<Span<'static>> = if columns && !col_keys.is_empty() && fmt.has_fields() {
-            column_spans(&theme, &raw, fmt, &col_keys, width)
+        let body: Vec<Span<'static>> = if let Some(l) = col_layout {
+            column_spans(
+                &theme,
+                &raw,
+                fmt,
+                l,
+                ascii,
+                search_re.as_ref(),
+                is_current_match,
+                highlight_re.as_ref(),
+            )
         } else {
             let (text, meta2) = display_text(&raw, &meta, fmt, ts_display, origin, year);
             line_spans(
@@ -407,44 +618,112 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     t.last_height = height;
 }
 
-/// Field-column rendering for structured lines.
+/// Split `text` into spans with search / highlight matches overlaid on
+/// `base`.
+fn overlay(
+    theme: &Theme,
+    text: String,
+    base: Style,
+    search: Option<&regex::bytes::Regex>,
+    current: bool,
+    highlight: Option<&regex::bytes::Regex>,
+) -> Vec<Span<'static>> {
+    let bytes = text.as_bytes();
+    let mut marks: Vec<(usize, usize, Style)> = Vec::new();
+    if let Some(re) = highlight {
+        for (a, b) in match_ranges(re, bytes) {
+            marks.push((a, b, theme.highlight()));
+        }
+    }
+    if let Some(re) = search {
+        for (a, b) in match_ranges(re, bytes) {
+            marks.push((a, b, theme.match_style(current)));
+        }
+    }
+    if marks.is_empty() {
+        return vec![Span::styled(text, base)];
+    }
+    marks.sort_by_key(|m| m.0);
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for (a, b, style) in marks {
+        let (a, b) = (a.max(pos), b.min(text.len()));
+        if a >= b || !text.is_char_boundary(a) || !text.is_char_boundary(b) {
+            continue;
+        }
+        if a > pos {
+            out.push(Span::styled(text[pos..a].to_string(), base));
+        }
+        out.push(Span::styled(text[a..b].to_string(), style));
+        pos = b;
+    }
+    if pos < text.len() {
+        out.push(Span::styled(text[pos..].to_string(), base));
+    }
+    out
+}
+
+/// A field value made safe for one terminal cell row.
+fn cell_text(v: &str) -> String {
+    v.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Field-column rendering for structured lines: one padded cell per layout
+/// key (blank when the line lacks it), the message unpadded, then any
+/// other fields as dim `key=value` pairs.
+#[allow(clippy::too_many_arguments)]
 fn column_spans(
     theme: &Theme,
     raw: &[u8],
     fmt: Format,
-    keys: &[String],
-    width: usize,
+    layout: &ColumnLayout,
+    ascii: bool,
+    search: Option<&regex::bytes::Regex>,
+    current: bool,
+    highlight: Option<&regex::bytes::Regex>,
 ) -> Vec<Span<'static>> {
     let fields = hem_core::fields::extract(raw, fmt);
     let mut spans = Vec::new();
-    let colw = (width / keys.len().max(1)).clamp(8, 40);
-    let mut used = 0usize;
-    for k in keys {
-        let v = fields
-            .iter()
-            .find(|(kk, _)| kk == k)
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
-        let cell = super::widgets::pad(v, colw - 1, true);
-        let style = match hem_core::Level::parse(v) {
+    let mut used = vec![false; fields.len()];
+    for (k, w) in layout.keys.iter().zip(&layout.widths) {
+        let v = match ColumnLayout::field_for(&fields, k) {
+            Some(i) => {
+                used[i] = true;
+                cell_text(&fields[i].1)
+            }
+            None => String::new(),
+        };
+        let style = match hem_core::Level::parse(&v) {
             Some(l) if k.contains("level") || k.contains("severity") => theme.level_style(l),
             _ if v.parse::<f64>().is_ok() => theme.fg_style(theme.number),
             _ => Style::default(),
         };
-        spans.push(Span::styled(format!("{cell} "), style));
-        used += colw;
-        if used >= width {
-            break;
-        }
+        let cell = if *w == 0 {
+            v
+        } else {
+            super::widgets::pad(&v, *w, ascii)
+        };
+        spans.extend(overlay(theme, cell, style, search, current, highlight));
+        spans.push(Span::raw(" "));
     }
     // Remaining fields inline.
     let rest: Vec<String> = fields
         .iter()
-        .filter(|(k, _)| !keys.contains(k))
-        .map(|(k, v)| format!("{k}={v}"))
+        .zip(&used)
+        .filter(|(_, u)| !**u)
+        .map(|((k, v), _)| format!("{k}={}", cell_text(v)))
         .collect();
     if !rest.is_empty() {
-        spans.push(Span::styled(rest.join(" "), theme.dim_style()));
+        spans.extend(overlay(
+            theme,
+            rest.join(" "),
+            theme.dim_style(),
+            search,
+            current,
+            highlight,
+        ));
     }
     spans
 }

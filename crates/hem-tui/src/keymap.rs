@@ -39,6 +39,9 @@ pub enum Action {
     Templates,
     Detail,
     Pin,
+    NextPin,
+    PrevPin,
+    ClearPins,
     HighlightValue,
     ClearHighlight,
     Copy,
@@ -86,7 +89,7 @@ impl Category {
 }
 
 impl Action {
-    pub const ALL: [Action; 48] = [
+    pub const ALL: [Action; 51] = [
         Action::ScrollUp,
         Action::ScrollDown,
         Action::ScrollLeft,
@@ -115,6 +118,9 @@ impl Action {
         Action::Templates,
         Action::Detail,
         Action::Pin,
+        Action::NextPin,
+        Action::PrevPin,
+        Action::ClearPins,
         Action::HighlightValue,
         Action::ClearHighlight,
         Action::Copy,
@@ -166,7 +172,10 @@ impl Action {
             Action::Expand => "Expand / collapse repeated run",
             Action::Templates => "Templates view",
             Action::Detail => "Line detail",
-            Action::Pin => "Pin / unpin line",
+            Action::Pin => "Pin / unpin line (kept on screen)",
+            Action::NextPin => "Next pinned line",
+            Action::PrevPin => "Previous pinned line",
+            Action::ClearPins => "Unpin all lines",
             Action::HighlightValue => "Highlight lines sharing a value",
             Action::ClearHighlight => "Clear highlight",
             Action::Copy => "Copy line",
@@ -202,9 +211,8 @@ impl Action {
                 Category::Filters
             }
             NextError | PrevError | ToggleCollapse | Expand | Templates | Detail | Pin
-            | HighlightValue | ClearHighlight | SortTemplates | SortTemplatesReverse => {
-                Category::Insight
-            }
+            | NextPin | PrevPin | ClearPins | HighlightValue | ClearHighlight | SortTemplates
+            | SortTemplatesReverse => Category::Insight,
             ToggleWrap | ToggleColumns | CycleTimestamp => Category::View,
             Copy | CopyView | Sources | OpenFile | Palette | Settings | Help | Close | Quit
             | Refresh => Category::App,
@@ -431,6 +439,8 @@ impl Default for KeyMap {
             (Key::ch('t'), Templates),
             (Key::new(KeyCode::Enter, KeyModifiers::NONE), Detail),
             (Key::ch('p'), Pin),
+            (Key::ch(']'), NextPin),
+            (Key::ch('['), PrevPin),
             (Key::ch('*'), HighlightValue),
             (Key::ch('y'), Copy),
             (Key::ch('Y'), CopyView),

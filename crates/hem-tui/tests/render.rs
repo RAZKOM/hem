@@ -380,3 +380,121 @@ fn follow_sticks_to_bottom_as_source_grows() {
     let lines = render(&mut app, 60, 10);
     assert!(lines[0].contains("following"), "{}", lines[0]);
 }
+
+/// A long log with one distinctive line near the top.
+fn long_log() -> String {
+    let mut s = String::from("2026-10-13 10:00:00.000 ERROR the line worth keeping\n");
+    for i in 1..200 {
+        s.push_str(&format!(
+            "2026-10-13 10:{:02}:{:02}.000 INFO  routine line {i}\n",
+            i / 60,
+            i % 60
+        ));
+    }
+    s
+}
+
+#[test]
+fn pinned_lines_stay_on_screen_and_are_jumpable() {
+    let mut app = app_with(&long_log(), false);
+    key(&mut app, 'p');
+    app.tick();
+    key(&mut app, 'G');
+    let lines = render(&mut app, 100, 30);
+    let body = joined(&lines);
+    // Scrolled to the bottom, the pinned line is still shown in the strip.
+    assert!(body.contains("the line worth keeping"), "{body}");
+    assert!(body.contains("1 pinned"), "{body}");
+    assert!(body.contains("routine line 199"), "{body}");
+    // ']' wraps around to the pin.
+    key(&mut app, ']');
+    assert_eq!(app.tab().cursor, 0);
+    // Clicking the pin in the strip jumps there too.
+    key(&mut app, 'G');
+    let _ = render(&mut app, 100, 30);
+    let pin_hit = app
+        .hits
+        .iter()
+        .find(|(_, h)| matches!(h, hem_tui::app::Hit::Pin(0)))
+        .map(|(r, _)| *r)
+        .expect("pin hit");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pin_hit.x + 5,
+        row: pin_hit.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.tab().cursor, 0);
+    // The minimap marks the pin.
+    let lines = render(&mut app, 100, 30);
+    assert!(joined(&lines).contains('◆'));
+}
+
+#[test]
+fn pins_hidden_by_filters_are_reported() {
+    let mut app = app_with(&long_log(), false);
+    key(&mut app, 'j');
+    key(&mut app, 'p'); // pin "routine line 1"
+    key(&mut app, 'l');
+    key(&mut app, 'l');
+    key(&mut app, 'l');
+    key(&mut app, 'l'); // level >= error
+    wait_view(&app);
+    app.tick();
+    let lines = render(&mut app, 100, 30);
+    let body = joined(&lines);
+    assert!(body.contains("filtered out"), "{body}");
+    assert!(body.contains("routine line 1"), "{body}");
+}
+
+fn json_log() -> String {
+    let mut s = String::new();
+    for i in 0..60 {
+        let extra = if i % 2 == 0 { ",\"user\":\"bob\"" } else { "" };
+        s.push_str(&format!(
+            "{{\"time\":\"2026-10-13T10:00:{:02}Z\",\"level\":\"info\",\"status\":{},\"msg\":\"request {i}\"{extra}}}\n",
+            i,
+            200 + i % 3
+        ));
+    }
+    s
+}
+
+#[test]
+fn field_columns_have_a_stable_header() {
+    let mut app = app_with(&json_log(), false);
+    key(&mut app, 'C');
+    let lines = render(&mut app, 120, 20);
+    let header = lines
+        .iter()
+        .find(|l| l.contains("status") && l.contains("msg"))
+        .cloned()
+        .expect("header");
+    let col = |l: &str, needle: &str| l.find(needle);
+    // Values sit under their header.
+    let row = lines
+        .iter()
+        .find(|l| l.contains("request 0 "))
+        .cloned()
+        .expect("row");
+    assert_eq!(
+        col(&header, "msg"),
+        col(&row, "request 0"),
+        "{header}\n{row}"
+    );
+    // Scrolling does not change the columns.
+    let before = app.tab().col_layout.clone();
+    for _ in 0..30 {
+        key(&mut app, 'j');
+    }
+    let lines = render(&mut app, 120, 20);
+    assert_eq!(app.tab().col_layout, before);
+    // Compare the log column only (the scrollbar moves).
+    let log = |l: &str| l.chars().take(100).collect::<String>();
+    assert!(
+        lines.iter().any(|l| log(l) == log(&header)),
+        "{}",
+        joined(&lines)
+    );
+    assert!(header.find("time") < header.find("level"), "{header}");
+}

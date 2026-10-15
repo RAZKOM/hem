@@ -42,8 +42,16 @@ pub enum Hit {
     Chip(usize),
     ClearChips,
     Row(usize),
-    Minimap { cell: usize, cells: usize },
-    Track { cell: usize, cells: usize },
+    /// A line in the pinned strip (index into `Tab::pins`).
+    Pin(usize),
+    Minimap {
+        cell: usize,
+        cells: usize,
+    },
+    Track {
+        cell: usize,
+        cells: usize,
+    },
     Scrollbar,
     Action(Action),
     ModalItem(usize),
@@ -90,7 +98,12 @@ pub struct Tab {
     pub search: Option<Search>,
     pub search_text: String,
     pub current_match: Option<usize>,
+    /// Pinned lines as `(source, line)`, in the order they were pinned.
     pub pins: Vec<(u8, u64)>,
+    /// Where each pin sits in the current view (parallel to `pins`).
+    pub pin_pos: Vec<PinPos>,
+    /// Merged views: rows already scanned for unresolved pins.
+    pin_scan: usize,
     pub highlight: Option<Matcher>,
     pub clusters: Option<Clusters>,
     pub templates: TemplatesState,
@@ -103,7 +116,63 @@ pub struct Tab {
     pub member_cache: HashMap<usize, Vec<Row>>,
     pub pending_anchor: Option<(u8, u64)>,
     pub view_gen: u32,
+    /// Field-column layout; `None` until computed for the current view.
+    pub col_layout: Option<ColumnLayout>,
+    col_sampled_len: usize,
 }
+
+/// Where a pinned line sits in the current view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinPos {
+    /// Not located yet (the view is still being built).
+    Unknown,
+    Row(usize),
+    /// Filtered out of the current view.
+    Hidden,
+}
+
+/// Field-column layout, sampled once per view so columns stay put while
+/// scrolling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnLayout {
+    pub keys: Vec<String>,
+    /// Display width per key.  The message column (always last) has width
+    /// 0: it is not padded and the remaining fields follow it.
+    pub widths: Vec<usize>,
+    /// Width of the leading repeat-count column (0 when not collapsing).
+    pub count_w: usize,
+}
+
+impl ColumnLayout {
+    /// Index of the field shown in column `key`.  Timestamp, level and
+    /// message keys stand in for each other, so merged sources that name
+    /// them differently (`time` / `ts`, `msg` / `message`) share a column.
+    pub fn field_for(fields: &[hem_core::fields::Field], key: &str) -> Option<usize> {
+        fields.iter().position(|(k, _)| k == key).or_else(|| {
+            let group = alias_group(key)?;
+            fields.iter().position(|(k, _)| group.contains(&k.as_str()))
+        })
+    }
+}
+
+/// The alias group a column key belongs to, if any.
+fn alias_group(key: &str) -> Option<&'static [&'static str]> {
+    [&TIME_KEYS[..], &LEVEL_KEYS[..], &MESSAGE_KEYS[..]]
+        .into_iter()
+        .find(|g| g.contains(&key))
+}
+
+/// Columns at most, before the remaining fields are shown inline.
+const MAX_COLUMNS: usize = 10;
+/// Column width cap; longer values are truncated with an ellipsis.
+const MAX_COLUMN_WIDTH: usize = 32;
+/// Keys treated as the free-text message and placed last.
+const MESSAGE_KEYS: [&str; 5] = ["msg", "message", "@message", "event", "log"];
+/// Keys placed first, in this order of preference.
+const TIME_KEYS: [&str; 5] = ["time", "ts", "timestamp", "@timestamp", "datetime"];
+const LEVEL_KEYS: [&str; 5] = ["level", "lvl", "severity", "loglevel", "log.level"];
+/// Rows scanned per tick when locating pins in a merged view.
+const PIN_SCAN_BUDGET: usize = 2_000_000;
 
 impl std::fmt::Debug for Tab {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -145,6 +214,8 @@ impl Tab {
             search_text: String::new(),
             current_match: None,
             pins: Vec::new(),
+            pin_pos: Vec::new(),
+            pin_scan: 0,
             highlight: None,
             clusters: None,
             templates: TemplatesState::default(),
@@ -156,6 +227,8 @@ impl Tab {
             member_cache: HashMap::new(),
             pending_anchor: None,
             view_gen,
+            col_layout: None,
+            col_sampled_len: 0,
         }
     }
 
@@ -173,6 +246,235 @@ impl Tab {
 
     pub fn is_pinned(&self, row: Row) -> bool {
         self.pins.contains(&(row.source(), row.line()))
+    }
+
+    /// Pin or unpin a row.  Returns true when it is now pinned.
+    pub fn toggle_pin(&mut self, row: Row) -> bool {
+        let key = (row.source(), row.line());
+        let pinned = if let Some(i) = self.pins.iter().position(|p| *p == key) {
+            self.pins.remove(i);
+            false
+        } else {
+            self.pins.push(key);
+            true
+        };
+        self.invalidate_pins();
+        pinned
+    }
+
+    /// Forget where pins are; they are located again on the next tick.
+    pub fn invalidate_pins(&mut self) {
+        self.pin_pos = vec![PinPos::Unknown; self.pins.len()];
+        self.pin_scan = 0;
+    }
+
+    /// Locate pinned lines in the view.  Single-source views binary-search;
+    /// merged views (ordered by time, not line) scan the rows incrementally
+    /// with bounded work per call.  Returns true when anything changed.
+    pub fn resolve_pins(&mut self) -> bool {
+        if self.pin_pos.len() != self.pins.len() {
+            self.invalidate_pins();
+        }
+        if !self.pin_pos.contains(&PinPos::Unknown) {
+            return false;
+        }
+        let n = self.len();
+        let complete = self.view.is_complete() && self.base.is_complete();
+        let covers = |r: Row, src: u8, line: u64| {
+            r.source() == src && r.line() <= line && line < r.line() + r.count().max(1) as u64
+        };
+        let before = self.pin_pos.clone();
+        if !self.base.is_merged() {
+            for (i, &(src, line)) in self.pins.iter().enumerate() {
+                if self.pin_pos[i] != PinPos::Unknown || n == 0 {
+                    continue;
+                }
+                let p = self.view.row_for_line(src, line);
+                if self.view.row(p).is_some_and(|r| covers(r, src, line)) {
+                    self.pin_pos[i] = PinPos::Row(p);
+                } else if complete {
+                    self.pin_pos[i] = PinPos::Hidden;
+                }
+            }
+        } else {
+            let stop = (self.pin_scan + PIN_SCAN_BUDGET).min(n);
+            let mut a = self.pin_scan;
+            while a < stop {
+                let b = (a + 65_536).min(stop);
+                for (k, r) in self.view.rows(a, b).into_iter().enumerate() {
+                    for (i, &(src, line)) in self.pins.iter().enumerate() {
+                        if self.pin_pos[i] == PinPos::Unknown && covers(r, src, line) {
+                            self.pin_pos[i] = PinPos::Row(a + k);
+                        }
+                    }
+                }
+                a = b;
+            }
+            self.pin_scan = a;
+            if complete && a >= n {
+                for p in &mut self.pin_pos {
+                    if *p == PinPos::Unknown {
+                        *p = PinPos::Hidden;
+                    }
+                }
+            }
+        }
+        self.pin_pos != before
+    }
+
+    /// Pin indices in view order: located pins by row, then the rest by
+    /// source and line.
+    pub fn pins_in_order(&self) -> Vec<(usize, PinPos)> {
+        let mut v: Vec<(usize, PinPos)> = (0..self.pins.len())
+            .map(|i| (i, self.pin_pos.get(i).copied().unwrap_or(PinPos::Unknown)))
+            .collect();
+        v.sort_by_key(|(i, p)| match p {
+            PinPos::Row(r) => (0, *r as u64, 0),
+            _ => (1, self.pins[*i].0 as u64, self.pins[*i].1),
+        });
+        v
+    }
+
+    /// The field-column layout for this view, sampling it if needed.
+    pub fn ensure_columns(&mut self) -> &ColumnLayout {
+        let n = self.len();
+        let stale = match &self.col_layout {
+            None => true,
+            // Nothing structured seen yet: try again as rows arrive.
+            Some(l) => l.keys.is_empty() && n != self.col_sampled_len,
+        };
+        if stale {
+            self.col_layout = Some(self.compute_columns());
+            self.col_sampled_len = n;
+        }
+        self.col_layout.get_or_insert_with(ColumnLayout::default)
+    }
+
+    /// Pick columns from a sample of rows near the current position and
+    /// spread over the view: keys present in at least a fifth of the
+    /// structured lines, in their usual order, the message key last; each
+    /// column as wide as 90 % of its values.
+    fn compute_columns(&self) -> ColumnLayout {
+        let n = self.len();
+        let mut samples: Vec<(Format, Vec<u8>)> = Vec::new();
+        if n > 0 {
+            let a = self.top.min(n - 1);
+            let b = (a + 200).min(n);
+            let chunk = self.view.chunk(a, b);
+            for k in 0..chunk.len() {
+                samples.push((
+                    self.format_for(chunk.row(k).source()),
+                    chunk.line(k).to_vec(),
+                ));
+            }
+            if n > b - a {
+                for i in 0..200 {
+                    if let Some(row) = self.view.row(i * n / 200) {
+                        samples.push((self.format_for(row.source()), self.line_bytes(row)));
+                    }
+                }
+            }
+        }
+        struct Stat {
+            count: usize,
+            pos: f64,
+            widths: Vec<usize>,
+        }
+        let mut stats: HashMap<String, Stat> = HashMap::new();
+        let mut structured = 0usize;
+        for (fmt, line) in &samples {
+            if !fmt.has_fields() {
+                continue;
+            }
+            let fields = hem_core::fields::extract(line, *fmt);
+            if fields.is_empty() {
+                continue;
+            }
+            structured += 1;
+            let len = fields.len() as f64;
+            for (i, (k, v)) in fields.into_iter().enumerate() {
+                let s = stats.entry(k).or_insert(Stat {
+                    count: 0,
+                    pos: 0.0,
+                    widths: Vec::new(),
+                });
+                s.count += 1;
+                s.pos += i as f64 / len;
+                s.widths
+                    .push(unicode_width::UnicodeWidthStr::width(v.as_str()));
+            }
+        }
+        if structured == 0 {
+            return ColumnLayout::default();
+        }
+        // Fold aliases into the most common member of each group.
+        for group in [&TIME_KEYS[..], &LEVEL_KEYS[..], &MESSAGE_KEYS[..]] {
+            let mut present: Vec<String> = group
+                .iter()
+                .filter(|k| stats.contains_key(**k))
+                .map(|k| k.to_string())
+                .collect();
+            if present.len() < 2 {
+                continue;
+            }
+            present.sort_by_key(|k| std::cmp::Reverse(stats[k].count));
+            let primary = present.remove(0);
+            for k in present {
+                if let Some(s) = stats.remove(&k) {
+                    let p = stats.get_mut(&primary).expect("primary present");
+                    p.count += s.count;
+                    p.pos += s.pos;
+                    p.widths.extend(s.widths);
+                }
+            }
+        }
+        let mut keys: Vec<(String, f64)> = stats
+            .iter()
+            .filter(|(_, s)| s.count * 5 >= structured)
+            .map(|(k, s)| (k.clone(), s.pos / s.count as f64))
+            .collect();
+        // Timestamp first, then level, then the rest in their usual order
+        // (JSON objects come back with sorted keys, so this matters).
+        let rank = |k: &str| {
+            if TIME_KEYS.contains(&k) {
+                0
+            } else if LEVEL_KEYS.contains(&k) {
+                1
+            } else {
+                2
+            }
+        };
+        keys.sort_by(|a, b| {
+            rank(&a.0)
+                .cmp(&rank(&b.0))
+                .then(a.1.total_cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut keys: Vec<String> = keys.into_iter().map(|(k, _)| k).collect();
+        let msg = MESSAGE_KEYS
+            .iter()
+            .find_map(|m| keys.iter().position(|k| k == m));
+        let msg_key = msg.map(|i| keys.remove(i));
+        keys.truncate(MAX_COLUMNS - usize::from(msg_key.is_some()));
+        let mut widths: Vec<usize> = keys
+            .iter()
+            .map(|k| {
+                let mut w = stats[k].widths.clone();
+                w.sort_unstable();
+                let p90 = w[(w.len() * 9 / 10).min(w.len() - 1)];
+                p90.max(unicode_width::UnicodeWidthStr::width(k.as_str()))
+                    .clamp(1, MAX_COLUMN_WIDTH)
+            })
+            .collect();
+        if let Some(m) = msg_key {
+            keys.push(m);
+            widths.push(0);
+        }
+        ColumnLayout {
+            keys,
+            widths,
+            count_w: if self.collapse { 7 } else { 0 },
+        }
     }
 
     pub fn line_bytes(&self, row: Row) -> Vec<u8> {
@@ -478,6 +780,7 @@ impl App {
                 .map(|c| !c.is_complete())
                 .unwrap_or(false)
             || t.pending_anchor.is_some()
+            || (t.base.is_merged() && t.pin_pos.contains(&PinPos::Unknown) && t.pin_scan < t.len())
     }
 
     pub fn log_debug(&mut self, msg: &str) {
@@ -552,6 +855,8 @@ impl App {
                 t.expanded.clear();
                 t.member_cache.clear();
                 t.meta.clear();
+                t.invalidate_pins();
+                t.col_layout = None;
             }
             // Pending anchor after a view rebuild.
             if let Some((src, line)) = t.pending_anchor {
@@ -576,6 +881,9 @@ impl App {
             if n != t.last_len {
                 t.last_len = n;
             }
+        }
+        if self.tab_mut().resolve_pins() {
+            self.mark_dirty();
         }
         // Progress text changes should redraw.
         let p = self.progress_text();
@@ -734,6 +1042,8 @@ impl App {
         t.view_gen = t.view.generation();
         t.expanded.clear();
         t.member_cache.clear();
+        t.invalidate_pins();
+        t.col_layout = None;
         t.current_match = None;
         t.last_len = 0;
         t.pending_anchor = anchor;
@@ -940,15 +1250,31 @@ impl App {
             Action::Pin => {
                 let t = self.tab_mut();
                 if let Some(r) = t.view.row(t.cursor) {
-                    let key = (r.source(), r.line());
-                    if let Some(i) = t.pins.iter().position(|p| *p == key) {
-                        t.pins.remove(i);
-                        self.notice("unpinned");
+                    if t.toggle_pin(r) {
+                        t.resolve_pins();
+                        let keys = format!(
+                            "{} / {}",
+                            self.keymap.keys_label(Action::NextPin, self.ascii),
+                            self.keymap.keys_label(Action::PrevPin, self.ascii)
+                        );
+                        self.notice(format!("pinned · {keys} jumps between pins"));
                     } else {
-                        t.pins.push(key);
-                        self.notice("pinned");
+                        self.notice("unpinned");
                     }
                 }
+            }
+            Action::NextPin => self.jump_pin(true),
+            Action::PrevPin => self.jump_pin(false),
+            Action::ClearPins => {
+                let t = self.tab_mut();
+                let n = t.pins.len();
+                t.pins.clear();
+                t.invalidate_pins();
+                self.notice(match n {
+                    0 => "no pins".to_string(),
+                    1 => "unpinned 1 line".to_string(),
+                    n => format!("unpinned {n} lines"),
+                });
             }
             Action::HighlightValue => self.open_prompt(PromptKind::Highlight, ""),
             Action::ClearHighlight => {
@@ -964,6 +1290,21 @@ impl App {
             Action::ToggleColumns => {
                 let t = self.tab_mut();
                 t.columns = !t.columns;
+                if !t.columns {
+                    self.notice("field columns off");
+                } else {
+                    t.col_layout = None;
+                    let n = t.ensure_columns().keys.len();
+                    if n == 0 {
+                        self.notice_warn("field columns: no JSON / logfmt fields in view yet");
+                    } else {
+                        self.notice(format!(
+                            "field columns: {n} · {} / {} scroll sideways",
+                            self.keymap.keys_label(Action::ScrollLeft, self.ascii),
+                            self.keymap.keys_label(Action::ScrollRight, self.ascii)
+                        ));
+                    }
+                }
             }
             Action::CycleTimestamp => {
                 self.ts_display = match self.ts_display {
@@ -1053,6 +1394,70 @@ impl App {
                 self.notice(format!("match {}/{total}", i + 1));
             }
             None => self.notice("no matches"),
+        }
+    }
+
+    /// Jump to the next / previous pinned line, wrapping around.
+    fn jump_pin(&mut self, forward: bool) {
+        let pin_key = self.keymap.keys_label(Action::Pin, self.ascii);
+        let t = self.tab_mut();
+        if t.pins.is_empty() {
+            self.notice(format!("no pins · {pin_key} pins the current line"));
+            return;
+        }
+        t.resolve_pins();
+        let mut rows: Vec<usize> = t
+            .pin_pos
+            .iter()
+            .filter_map(|p| match p {
+                PinPos::Row(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let hidden = t.pin_pos.iter().filter(|p| **p == PinPos::Hidden).count();
+        if rows.is_empty() {
+            let all_hidden = hidden == t.pins.len();
+            self.notice(if all_hidden {
+                "pinned lines are hidden by the current filters"
+            } else {
+                "still locating pinned lines…"
+            });
+            return;
+        }
+        let cur = t.cursor;
+        let i = if forward {
+            rows.iter().position(|&r| r > cur).unwrap_or(0)
+        } else {
+            rows.iter()
+                .rposition(|&r| r < cur)
+                .unwrap_or(rows.len() - 1)
+        };
+        let total = rows.len();
+        self.center_on(rows[i]);
+        let extra = if hidden > 0 {
+            format!(" · {hidden} hidden by filters")
+        } else {
+            String::new()
+        };
+        self.notice(format!("pin {}/{total}{extra}", i + 1));
+    }
+
+    /// Jump to one pin (clicked in the pinned strip).
+    pub fn jump_to_pin(&mut self, idx: usize) {
+        let t = self.tab_mut();
+        t.resolve_pins();
+        let Some(&key) = t.pins.get(idx) else {
+            return;
+        };
+        match t.pin_pos.get(idx).copied().unwrap_or(PinPos::Unknown) {
+            PinPos::Row(r) => self.center_on(r),
+            PinPos::Hidden => self.notice("that pinned line is hidden by the current filters"),
+            PinPos::Unknown => {
+                t.pending_anchor = Some(key);
+                t.follow = false;
+            }
         }
     }
 
@@ -1722,13 +2127,8 @@ impl App {
                     self.copy_text(text, "line");
                 }
                 KeyCode::Char('p') => {
-                    let key = (row.source(), row.line());
-                    let t = self.tab_mut();
-                    if let Some(i) = t.pins.iter().position(|p| *p == key) {
-                        t.pins.remove(i);
-                    } else {
-                        t.pins.push(key);
-                    }
+                    let r = *row;
+                    self.tab_mut().toggle_pin(r);
                 }
                 KeyCode::Char('*') => {
                     let t = self.tab();
@@ -2011,6 +2411,11 @@ impl App {
                         // Second click on the same row opens detail / expands.
                         self.do_action(Action::Expand);
                     }
+                }
+            }
+            Hit::Pin(i) => {
+                if self.modal.is_none() {
+                    self.jump_to_pin(i);
                 }
             }
             Hit::Minimap { cell, cells } => self.jump_minimap(cell, cells),

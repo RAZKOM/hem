@@ -10,7 +10,7 @@ use ratatui::Frame;
 use hem_core::timeline::Counts;
 use hem_core::Level;
 
-use crate::app::{App, Hit};
+use crate::app::{App, Hit, PinPos, Tab};
 
 /// Highest severity present in a bucket.
 pub fn top_level(c: &Counts) -> Option<Level> {
@@ -113,6 +113,26 @@ fn bar(len: u8, width: usize, ascii: bool) -> String {
     s
 }
 
+/// Timestamp of a row, inherited from up to four rows above it.
+fn row_ts(t: &Tab, row: usize) -> Option<i64> {
+    let start = row.saturating_sub(4);
+    let chunk = t.view.chunk(start, row + 1);
+    for k in (0..chunk.len()).rev() {
+        let m = hem_core::parse::parse_line(
+            chunk.line(k),
+            t.format_for(chunk.row(k).source()),
+            t.view.default_year(),
+        );
+        if let Some(ts) = m.ts {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+/// Most pins marked on the minimap (each costs a row lookup per frame).
+const MAX_PIN_MARKS: usize = 64;
+
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     if area.height == 0 || area.width < 2 {
         return;
@@ -131,23 +151,8 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         let top = t.top.min(len - 1);
         let bottom = (t.top + t.last_height.max(1)).min(len).saturating_sub(1);
         if hist.is_time() && hist.total > 0 {
-            let ts_of = |row: usize| -> Option<i64> {
-                let start = row.saturating_sub(4);
-                let chunk = t.view.chunk(start, row + 1);
-                for k in (0..chunk.len()).rev() {
-                    let m = hem_core::parse::parse_line(
-                        chunk.line(k),
-                        t.format_for(chunk.row(k).source()),
-                        t.view.default_year(),
-                    );
-                    if let Some(ts) = m.ts {
-                        return Some(ts);
-                    }
-                }
-                None
-            };
-            let a = ts_of(top).map(|ts| hist.cell_of(ts, n)).unwrap_or(0);
-            let b = ts_of(bottom).map(|ts| hist.cell_of(ts, n)).unwrap_or(a);
+            let a = row_ts(t, top).map(|ts| hist.cell_of(ts, n)).unwrap_or(0);
+            let b = row_ts(t, bottom).map(|ts| hist.cell_of(ts, n)).unwrap_or(a);
             (a.min(b), a.max(b))
         } else {
             let a = top * n / len.max(1);
@@ -155,11 +160,35 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
             (a.min(n - 1), b.min(n - 1))
         }
     };
+    // Pinned lines, as cells.
+    let mut pinned = vec![false; n];
+    if len > 0 {
+        let rows = t.pin_pos.iter().filter_map(|p| match p {
+            PinPos::Row(r) => Some(*r),
+            _ => None,
+        });
+        for r in rows.take(MAX_PIN_MARKS) {
+            let cell = if hist.is_time() && hist.total > 0 {
+                row_ts(t, r).map(|ts| hist.cell_of(ts, n))
+            } else {
+                (r * n).checked_div(len)
+            };
+            if let Some(c) = cell {
+                pinned[c.min(n - 1)] = true;
+            }
+        }
+    }
     let bar_w = (area.width - 1) as usize;
     let mut lines = Vec::with_capacity(n);
     for (i, (h, lvl, _)) in cells.iter().enumerate() {
         let in_view = i >= v0 && i <= v1 && len > 0;
-        let marker = if in_view {
+        let marker = if pinned[i] {
+            let mut s = theme.fg_style(theme.pin).add_modifier(Modifier::BOLD);
+            if in_view && !theme.is_mono() {
+                s = s.bg(theme.selection_bg);
+            }
+            Span::styled(if ascii { "*" } else { "◆" }, s)
+        } else if in_view {
             Span::styled(
                 if ascii { ">" } else { "▐" },
                 theme

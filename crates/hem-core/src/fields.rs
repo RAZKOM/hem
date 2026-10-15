@@ -19,10 +19,19 @@ pub fn extract(line: &[u8], format: Format) -> Vec<Field> {
 
 /// Fast path: fetch a single top-level value by key without building the
 /// whole field list.  Works for JSON (string / number / bool values) and
-/// logfmt.
+/// logfmt.  Dotted JSON keys (`ctx.user`) that are not top-level keys fall
+/// back to the flattened field list.
 pub fn get<'a>(line: &'a [u8], format: Format, key: &str) -> Option<std::borrow::Cow<'a, str>> {
     match format {
-        Format::Json => json_get(line, key),
+        Format::Json => json_get(line, key).or_else(|| {
+            if !key.contains('.') {
+                return None;
+            }
+            json_fields(line)
+                .into_iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| std::borrow::Cow::Owned(v))
+        }),
         Format::Logfmt => logfmt_get(line, key).map(String::from_utf8_lossy),
         _ => extract(line, format)
             .into_iter()
@@ -384,6 +393,9 @@ mod tests {
         assert_eq!(json_get(l, "nope"), None);
         assert_eq!(json_get(b"not json", "x"), None);
         assert_eq!(json_get(br#"{"a":"#, "a"), None);
+        // Nested keys go through the flattened fields.
+        assert_eq!(get(l, Format::Json, "ctx.user").as_deref(), Some("bob"));
+        assert_eq!(get(l, Format::Json, "ctx.nope"), None);
     }
 
     #[test]

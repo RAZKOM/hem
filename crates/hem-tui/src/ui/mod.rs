@@ -76,7 +76,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
 }
 
-/// Log pane + minimap + scrollbar.
+/// Pinned strip + column header + log pane, then scrollbar and minimap.
 fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
     let minimap_w: u16 = if app.minimap && area.width >= 40 {
         4
@@ -92,7 +92,27 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect) {
             Constraint::Length(minimap_w),
         ])
         .split(area);
-    logpane::render(app, frame, chunks[0]);
+    if app.tab().columns {
+        app.tab_mut().ensure_columns();
+    }
+    let log = chunks[0];
+    let pin_h = logpane::pin_strip_height(app, log.height);
+    let header_h = u16::from(logpane::column_header_visible(app));
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(pin_h),
+            Constraint::Length(header_h),
+            Constraint::Min(1),
+        ])
+        .split(log);
+    if pin_h > 0 {
+        logpane::pins(app, frame, parts[0]);
+    }
+    if header_h > 0 {
+        logpane::column_header(app, frame, parts[1]);
+    }
+    logpane::render(app, frame, parts[2]);
     logpane::scrollbar(app, frame, chunks[1]);
     if minimap_w > 0 {
         minimap::render(app, frame, chunks[2]);

@@ -387,10 +387,25 @@ fn help(app: &mut App, frame: &mut Frame, area: Rect, scroll: usize) {
     }
     lines.push(Line::from(Span::styled(" Filters", theme.title_style())));
     for l in [
+        "   filters hide lines; search (/) and highlight (*) only mark them",
+        "   all filters must hold (AND); for OR use one regex: timeout|refused",
         "   include/exclude take regexes (smart case: all-lowercase = case-insensitive)",
-        "   field filters: status>=500  user=bob  msg~time.?out  err!=  trace_id?",
+        "   field filters: status>=500  user=bob  ctx.user=bob  msg~time.?out  trace_id?",
+        "   not sure of a key's name? Enter on a line lists its fields",
+        "   filter editor (F): several entries per row separated by &&",
+        "   time: 15m · 2h · today · 10:30 · 2026-10-13T10:30:00Z (no zone = UTC)",
         "   go to: 1234 (line) · 50% · 10:30 · 2026-10-13T10:30:00Z · 15m (ago)",
         "   templates view: Enter shows a template's occurrences; sort ascending to find rare lines",
+        "   full guide: github.com/RAZKOM/hem/blob/main/docs/filtering.md",
+    ] {
+        lines.push(Line::from(Span::raw(l)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Pins", theme.title_style())));
+    for l in [
+        "   pinned lines stay in a strip above the log, however far you scroll",
+        "   the minimap marks them; click a pinned line to jump to it",
+        "   pins survive filter changes; hidden ones show as \"filtered out\"",
     ] {
         lines.push(Line::from(Span::raw(l)));
     }
