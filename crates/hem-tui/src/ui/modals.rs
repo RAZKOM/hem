@@ -423,9 +423,17 @@ fn sources(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
     let h = area.height.min((app.tabs.len() + 7) as u16);
     let inner = frame_box(app, frame, area, "Sources", w, h);
     let theme = app.theme.clone();
-    let mut lines = Vec::new();
     let n = app.tabs.len();
+    // Items are the tabs plus two actions; they scroll so the selection
+    // stays in view (with hundreds of files open).
+    let visible = (inner.height as usize).saturating_sub(2).max(1);
+    let first = (selected + 1).saturating_sub(visible);
+    let shown = first..(first + visible).min(n + 2);
+    let mut lines = Vec::new();
     for (i, t) in app.tabs.iter().enumerate() {
+        if !shown.contains(&i) {
+            continue;
+        }
         let srcs = t.base.sources();
         let info = if t.base.is_merged() {
             format!("merged · {} sources", srcs.len())
@@ -469,7 +477,7 @@ fn sources(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
         app.hits.push((
             Rect {
                 x: inner.x,
-                y: inner.y + i as u16,
+                y: inner.y + (i - first) as u16,
                 width: inner.width,
                 height: 1,
             },
@@ -481,6 +489,9 @@ fn sources(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
         ("open another file…", n + 1),
     ];
     for (label, idx) in extra {
+        if !shown.contains(&idx) {
+            continue;
+        }
         let style = if idx == selected {
             theme.selection().add_modifier(Modifier::BOLD)
         } else {
@@ -493,7 +504,7 @@ fn sources(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
         app.hits.push((
             Rect {
                 x: inner.x,
-                y: inner.y + idx as u16,
+                y: inner.y + (idx - first) as u16,
                 width: inner.width,
                 height: 1,
             },

@@ -6,7 +6,7 @@
 //! level statistics in the same pass, so the minimap always reflects what
 //! is being shown.
 //!
-//! Rows are packed into 8 bytes: 40 bits line index, 8 bits source index,
+//! Rows are packed into 8 bytes: 36 bits line index, 12 bits source index,
 //! 16 bits repeat count.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -33,29 +33,37 @@ pub const CHUNK_ROWS: usize = 32 * 1024;
 const CARRY_LOOKBACK: usize = 64;
 const MAX_COUNT: u32 = 0xFFFF;
 
+/// Index of a source within a [`Base`] (always 0 for a single source).
+pub type SourceId = u16;
+
 /// Packed row reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Row(u64);
 
 impl Row {
-    pub const LINE_BITS: u32 = 40;
+    pub const LINE_BITS: u32 = 36;
     pub const LINE_MASK: u64 = (1 << Self::LINE_BITS) - 1;
+    pub const SOURCE_BITS: u32 = 12;
+    const SOURCE_MASK: u64 = (1 << Self::SOURCE_BITS) - 1;
+    const COUNT_SHIFT: u32 = Self::LINE_BITS + Self::SOURCE_BITS;
 
-    pub fn new(line: u64, source: u8, count: u32) -> Self {
+    pub fn new(line: u64, source: SourceId, count: u32) -> Self {
         let count = count.min(MAX_COUNT) as u64;
-        Row((line & Self::LINE_MASK) | ((source as u64) << 40) | (count << 48))
+        Row((line & Self::LINE_MASK)
+            | ((source as u64 & Self::SOURCE_MASK) << Self::LINE_BITS)
+            | (count << Self::COUNT_SHIFT))
     }
 
     pub fn line(self) -> u64 {
         self.0 & Self::LINE_MASK
     }
 
-    pub fn source(self) -> u8 {
-        ((self.0 >> 40) & 0xFF) as u8
+    pub fn source(self) -> SourceId {
+        ((self.0 >> Self::LINE_BITS) & Self::SOURCE_MASK) as SourceId
     }
 
     pub fn count(self) -> u32 {
-        ((self.0 >> 48) & 0xFFFF) as u32
+        ((self.0 >> Self::COUNT_SHIFT) & 0xFFFF) as u32
     }
 
     pub fn with_count(self, count: u32) -> Self {
@@ -142,7 +150,7 @@ impl Chunk {
     }
 
     /// All bytes held for one source.
-    pub fn buf(&self, source: u8) -> &[u8] {
+    pub fn buf(&self, source: SourceId) -> &[u8] {
         self.bufs
             .get(source as usize)
             .map(|b| b.bytes())
@@ -169,7 +177,7 @@ impl Base {
         }
     }
 
-    pub fn source(&self, idx: u8) -> Option<Source> {
+    pub fn source(&self, idx: SourceId) -> Option<Source> {
         match self {
             Base::Single(s) if idx == 0 => Some(s.clone()),
             Base::Single(_) => None,
@@ -289,16 +297,21 @@ impl Base {
             let datas: Vec<Arc<Data>> = guards.iter().map(|g| g.data_arc()).collect();
             (raws, datas)
         };
-        // ...then file reads without holding them.
+        // ...then file reads without holding them.  Rows are bucketed by
+        // source in one pass (a merged chunk touches many sources).
+        let mut by_source: Vec<Vec<(usize, (u64, u64))>> = vec![Vec::new(); datas.len()];
+        for (k, r) in rows.iter().enumerate() {
+            if let (Some(bucket), Some(span)) = (by_source.get_mut(r.source() as usize), raws[k]) {
+                bucket.push((k, span));
+            }
+        }
         let mut spans = vec![(0u64, 0u32); rows.len()];
         let mut bufs = Vec::with_capacity(datas.len());
-        for (si, data) in datas.iter().enumerate() {
-            let mine: Vec<(usize, (u64, u64))> = rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.source() as usize == si)
-                .filter_map(|(k, _)| raws[k].map(|span| (k, span)))
-                .collect();
+        for (data, mine) in datas.iter().zip(by_source) {
+            if mine.is_empty() {
+                bufs.push(ChunkBuf::Owned(Vec::new()));
+                continue;
+            }
             if let Some(slice) = data.as_slice() {
                 for &(k, (s, e)) in &mine {
                     spans[k] = trimmed(slice, 0, s, e);
@@ -404,6 +417,8 @@ struct Inner {
     generation: AtomicU32,
     wakers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     default_year: i64,
+    /// Has the builder thread been started?
+    started: AtomicBool,
 }
 
 /// A background-built, scrollable list of rows.
@@ -429,6 +444,15 @@ impl Drop for Inner {
 impl View {
     /// Start building a view.  Returns immediately; rows stream in.
     pub fn start(base: Base, spec: ViewSpec) -> View {
+        let view = View::deferred(base, spec);
+        view.resume();
+        view
+    }
+
+    /// Create a view without building it yet; [`View::resume`] starts it.
+    /// Used for tabs nobody has looked at: with hundreds of files open,
+    /// building every per-file view up front would scan everything twice.
+    pub fn deferred(base: Base, spec: ViewSpec) -> View {
         let identity = spec.filter.is_empty() && !spec.collapse && !base.is_merged();
         let default_year = timestamp::current_year();
         let hist = initial_histogram(&base, default_year);
@@ -446,13 +470,28 @@ impl View {
             cancel: AtomicBool::new(false),
             wakers: Mutex::new(Vec::new()),
             default_year,
+            started: AtomicBool::new(false),
         });
-        let view = View(inner);
-        let v = view.clone();
+        View(inner)
+    }
+
+    /// Start building, if not started yet.  Cheap to call repeatedly.
+    pub fn resume(&self) {
+        if self.0.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // The base has probably been indexed meanwhile: size the timeline
+        // from what is known now.
+        *self.0.hist.write() = initial_histogram(&self.0.base, self.0.default_year);
+        let v = self.clone();
         let _ = std::thread::Builder::new()
             .name("hem-view".into())
             .spawn(move || builder_main(v));
-        view
+    }
+
+    /// Has building started?
+    pub fn is_started(&self) -> bool {
+        self.0.started.load(Ordering::Acquire)
     }
 
     pub fn base(&self) -> &Base {
@@ -514,7 +553,7 @@ impl View {
 
     /// Position of the row showing `line` of `source` (or the row just
     /// after it, if it was filtered out / collapsed).
-    pub fn row_for_line(&self, source: u8, line: u64) -> usize {
+    pub fn row_for_line(&self, source: SourceId, line: u64) -> usize {
         if self.0.identity {
             return (line as usize).min(self.len().saturating_sub(1));
         }
@@ -568,7 +607,7 @@ impl View {
 
     /// Current (detected or overridden) format of a source.  Resolved on
     /// every call so detection can settle after the first lines arrive.
-    pub fn format_for(&self, source: u8) -> Format {
+    pub fn format_for(&self, source: SourceId) -> Format {
         self.0
             .base
             .source(source)
@@ -838,6 +877,10 @@ fn builder_main(view: View) {
             v.generation.store(gen, Ordering::Release);
             view.wake();
         }
+        // Read "complete" before the length: the base appends rows before
+        // it flags completion, so this order can never mark the view
+        // complete while rows that arrived in between are unprocessed.
+        let base_done = v.base.is_complete();
         let avail = v.base.len();
         if avail > consumed {
             v.complete.store(false, Ordering::Release);
@@ -922,7 +965,7 @@ fn builder_main(view: View) {
             view.wake();
             continue;
         }
-        if v.base.is_complete() {
+        if base_done {
             v.complete.store(true, Ordering::Release);
             view.wake();
             if !v.base.is_live() {
@@ -969,11 +1012,13 @@ mod tests {
 
     #[test]
     fn row_packing() {
-        let r = Row::new(123_456_789_012, 7, 70_000);
-        assert_eq!(r.line(), 123_456_789_012);
-        assert_eq!(r.source(), 7);
+        let r = Row::new(68_000_000_000, 4095, 70_000);
+        assert_eq!(r.line(), 68_000_000_000);
+        assert_eq!(r.source(), 4095);
         assert_eq!(r.count(), 0xFFFF);
         assert_eq!(r.with_count(3).count(), 3);
+        let r = Row::new(Row::LINE_MASK, 300, 1);
+        assert_eq!((r.line(), r.source(), r.count()), (Row::LINE_MASK, 300, 1));
     }
 
     #[test]

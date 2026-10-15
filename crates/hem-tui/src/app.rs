@@ -20,7 +20,7 @@ use hem_core::parse::{parse_line, LineMeta, MetaCache};
 use hem_core::search::Search;
 use hem_core::source::{Notice as SourceNotice, SourceOptions};
 use hem_core::timestamp::{self, TsDisplay};
-use hem_core::view::{Base, Row, View, ViewSpec};
+use hem_core::view::{Base, Row, SourceId, View, ViewSpec};
 use hem_core::{Level, Source};
 
 use crate::clipboard::{Clipboard, CopyOutcome};
@@ -99,7 +99,7 @@ pub struct Tab {
     pub search_text: String,
     pub current_match: Option<usize>,
     /// Pinned lines as `(source, line)`, in the order they were pinned.
-    pub pins: Vec<(u8, u64)>,
+    pub pins: Vec<(SourceId, u64)>,
     /// Where each pin sits in the current view (parallel to `pins`).
     pub pin_pos: Vec<PinPos>,
     /// Merged views: rows already scanned for unresolved pins.
@@ -114,7 +114,7 @@ pub struct Tab {
     pub last_height: usize,
     pub last_len: usize,
     pub member_cache: HashMap<usize, Vec<Row>>,
-    pub pending_anchor: Option<(u8, u64)>,
+    pub pending_anchor: Option<(SourceId, u64)>,
     pub view_gen: u32,
     /// Field-column layout; `None` until computed for the current view.
     pub col_layout: Option<ColumnLayout>,
@@ -190,7 +190,9 @@ impl Tab {
         wrap: bool,
         columns: bool,
     ) -> Tab {
-        let view = View::start(
+        // Built when the tab is first shown (`App::tick` resumes the
+        // active tab's view).
+        let view = View::deferred(
             base.clone(),
             ViewSpec {
                 filter: filter.clone(),
@@ -240,7 +242,7 @@ impl Tab {
         self.view.is_empty()
     }
 
-    pub fn format_for(&self, source: u8) -> Format {
+    pub fn format_for(&self, source: SourceId) -> Format {
         self.view.format_for(source)
     }
 
@@ -280,7 +282,7 @@ impl Tab {
         }
         let n = self.len();
         let complete = self.view.is_complete() && self.base.is_complete();
-        let covers = |r: Row, src: u8, line: u64| {
+        let covers = |r: Row, src: SourceId, line: u64| {
             r.source() == src && r.line() <= line && line < r.line() + r.count().max(1) as u64
         };
         let before = self.pin_pos.clone();
@@ -738,6 +740,7 @@ impl App {
         if app.tabs.is_empty() {
             anyhow::bail!("no sources");
         }
+        app.tab().view.resume();
         Ok(app)
     }
 
@@ -815,6 +818,7 @@ impl App {
     // --- Periodic update ---------------------------------------------------
 
     pub fn tick(&mut self) {
+        self.tab().view.resume();
         let now = Instant::now();
         let before = self.notices.len();
         self.notices.retain(|n| n.until > now);

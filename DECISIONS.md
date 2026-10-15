@@ -6,9 +6,13 @@ needed. Items marked **review** deserve a look from the owner.
 ## Architecture
 
 - **Files are read, not memory-mapped, by default.** Reads go through
-  `pread` / `seek_read` with a 16 MiB LRU of 64 KiB pages per file
-  (`paged.rs`); big sequential reads (indexing, view building, search)
-  bypass the cache. A mapping would stop other processes from truncating the
+  `pread` / `seek_read` with an LRU of 64 KiB pages per file (`paged.rs`):
+  at most 16 MiB per file and 256 MiB across all files (a file may always
+  keep 1 MiB), so hundreds of open files cannot grow the caches to
+  gigabytes. When a miss follows the previous page, four pages are read in
+  one call; building a merged view walks every file a few lines at a time,
+  and one read per page made that several times slower than a mapping.
+  Big sequential reads (indexing, view building, search) bypass the cache. A mapping would stop other processes from truncating the
   file on Windows and can SIGBUS on Unix when the file is truncated. The
   cost: search over 5 GB takes ~1.2 s instead of ~0.4 s and the timeline
   pass ~2.5 s instead of ~1.9 s; first screen, indexing and scrolling are
@@ -38,10 +42,18 @@ needed. Items marked **review** deserve a look from the owner.
   what is actually displayed. Unfiltered, uncollapsed single-source views
   are an "identity" view: rows are virtual (no allocation), only the
   histogram pass runs.
-- **Rows are 8 bytes.** `line:40 | source:8 | count:16` packed into a `u64`.
-  Limits: 2^40 lines per source, 256 sources per merge, repeat counts cap at
-  65 535 (a longer run just starts a new row). **review**: if files with
-  more than ~1 T lines are a realistic target, widen the line field.
+- **Rows are 8 bytes.** `line:36 | source:12 | count:16` packed into a
+  `u64`. Limits: 2^36 (68 G) lines per source, 4096 sources per merge,
+  repeat counts cap at 65 535 (a longer run just starts a new row). The
+  source field was 8 bits (256 files), which real incidents spanning a few
+  hundred files ran into.
+- **Completion is read before length.** Every background producer appends
+  its rows before it sets its "complete" flag, so consumers (view builder,
+  search, template mining, the merge, plain mode) read the flag first and
+  the length second. The other order lost rows: a consumer that read the
+  length, then saw the producer complete, marked itself done with the
+  rows appended in between unprocessed. Merges of five or more files hit
+  this and stopped after one 32 768-row chunk.
 - **Level inheritance.** A line without a level (stack-trace frame,
   wrapped message) inherits the level and timestamp of the previous line
   for filtering, so `--level error` keeps the trace under an `ERROR` line.
@@ -91,6 +103,14 @@ needed. Items marked **review** deserve a look from the owner.
   pending lines but is still being written blocks the merge for at most one
   poll interval (250 ms) so follow mode stays live. Lines before the first
   timestamp of a source sort first. Any source rotation resets the merge.
+  The merge is a k-way merge on a binary heap (it used to scan every source
+  for each line, which grew with the file count), parses timestamps for
+  several sources in parallel, and buffers at most 4 M pending lines across
+  all sources (64 MB) rather than 128 k per source.
+- **Tabs build their views when first shown.** Each file is a tab, and with
+  `--merge` over hundreds of files only the merged tab is looked at;
+  building every per-file view up front scanned all the data twice. A
+  tab's view starts (`View::resume`) the first time it is the active tab.
 - **Custom formats** from the config (`[formats.<name>]`) are applied
   process-wide: a `level_regex` / `timestamp_regex` whose first capture
   group is used before the built-in detectors. Selected with
@@ -137,6 +157,10 @@ needed. Items marked **review** deserve a look from the owner.
   one-line prompt in the filter-bar slot (like Vim / less); everything else
   is a centred, dimmed-background modal with the focus trapped inside.
   Clicking outside a modal closes it.
+- **The tab bar and source picker scroll.** With more tabs than fit, the
+  tab bar shows a window around the active tab with "‹ N more" / "N more ›"
+  markers (clickable, one tab per click); the source picker scrolls to keep
+  the selection in view.
 - **The keymap is the single source of truth** for the help modal and the
   command palette; config overrides replace an action's bindings entirely.
 - **Settings auto-save** to the config file on every change (and `s` saves

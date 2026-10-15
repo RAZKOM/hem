@@ -122,6 +122,9 @@ fn run_inner(opts: PlainOptions) -> Result<ExitCode> {
             .collect();
         let mut printed = 0usize;
         loop {
+            // "Complete" before length, so nothing appended in between is
+            // skipped when we stop.
+            let done = view.is_complete() && base.is_complete();
             let n = view.len();
             while printed < n {
                 let end = (printed + 4096).min(n);
@@ -183,8 +186,7 @@ fn run_inner(opts: PlainOptions) -> Result<ExitCode> {
                     break;
                 }
             }
-            let done = view.is_complete() && base.is_complete();
-            if done {
+            if done && printed >= n {
                 out.flush()?;
                 if !opts.follow || !base.is_live() {
                     break;

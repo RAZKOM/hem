@@ -245,6 +245,12 @@ Cold-cache numbers are bounded by disk read speed (an NVMe SSD at ~3 GB/s
 indexes 5 GB in roughly 2–4 s). Redraws take well under a millisecond for a
 full screen; the event loop coalesces to 60 fps and idles at 200 ms polls.
 
+Many files: `cargo run --release --example merge_perf -- <dir>` merges
+every `*.log` in a directory. On 300 files of 4 MB (1.26 GB, 15.5 M lines,
+same machine), indexing all of them takes 0.2 s, the timestamp merge 1.2 s
+and the merged view 1.2 s. Merges take up to 4096 files, and the page cache
+stays under ~256 MB however many are open.
+
 Micro-benchmarks: `cargo bench` (`benches/index.rs`, `benches/search.rs`;
 set `HEM_BENCH_FILE=path` to index a real file).
 

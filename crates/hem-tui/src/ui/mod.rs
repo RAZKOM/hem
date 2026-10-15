@@ -20,6 +20,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
     app.size = (area.width, area.height);
     app.hits.clear();
+    app.tab().view.resume();
     frame.render_widget(
         ratatui::widgets::Block::default().style(app.theme.base()),
         area,

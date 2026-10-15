@@ -291,3 +291,34 @@ fn gzip_source_is_decompressed() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(out.lines().count(), 17, "{out}");
 }
+
+#[test]
+fn merging_many_files_prints_every_line() {
+    // Regression: with several sources the merge was still running when
+    // the view processed its first batch, and the view (and plain output)
+    // stopped after 32 768 lines.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut paths = Vec::new();
+    for f in 0..12 {
+        let p = dir.path().join(format!("svc{f}.log"));
+        let mut file = std::fs::File::create(&p).expect("create");
+        for i in 0..20_000 {
+            writeln!(
+                file,
+                "2026-10-13 10:{:02}:{:02}.{:03} INFO svc{f} line {i}",
+                i / 6000,
+                (i / 100) % 60,
+                (i % 100) * 10 + f
+            )
+            .expect("write");
+        }
+        paths.push(p.to_string_lossy().into_owned());
+    }
+    for _ in 0..3 {
+        let mut args: Vec<&str> = paths.iter().map(String::as_str).collect();
+        args.extend(["--merge", "--plain"]);
+        let (code, out, err) = run(&args);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out.lines().count(), 12 * 20_000);
+    }
+}

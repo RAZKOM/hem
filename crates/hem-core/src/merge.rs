@@ -3,7 +3,8 @@
 //! line's timestamp in the same source, so multi-line entries (stack
 //! traces) stay together.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -14,10 +15,10 @@ use parking_lot::{Mutex, RwLock};
 use crate::parse::parse_line;
 use crate::source::Source;
 use crate::timestamp;
-use crate::view::{Base, Row, CHUNK_ROWS};
+use crate::view::{Base, Row, SourceId, CHUNK_ROWS};
 
-/// Maximum number of sources in a merge (rows carry an 8-bit source id).
-pub const MAX_SOURCES: usize = 256;
+/// Maximum number of sources in a merge (rows carry a 12-bit source id).
+pub const MAX_SOURCES: usize = 1 << Row::SOURCE_BITS;
 
 /// A timestamp-merged set of sources.
 pub struct Merged {
@@ -138,6 +139,36 @@ fn stamp_lines(
     out
 }
 
+/// Pending lines buffered across all sources (16 bytes each).
+const PENDING_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Pending lines to buffer per source: the full chunk target for a few
+/// sources, less as the count grows so memory stays bounded.
+fn pending_target(sources: usize) -> usize {
+    (PENDING_BUDGET / sources.max(1)).clamp(1024, CHUNK_ROWS * 4)
+}
+
+/// A source has nothing more to give: complete, and every line consumed.
+/// Reads "complete" before the line count; a source appends lines before
+/// it flags completion, so this never misses lines added in between.
+fn exhausted(src: &Source, c: &Cursor) -> bool {
+    let done = src.is_complete();
+    done && c.pending.is_empty() && src.line_count() <= c.next_line
+}
+
+/// Top up a source's pending queue to `target` lines, if it has any.
+fn refill(src: &Source, c: &mut Cursor, target: usize, default_year: i64) -> bool {
+    let avail = src.line_count();
+    if c.pending.len() >= target || avail <= c.next_line {
+        return false;
+    }
+    let b = (c.next_line + target - c.pending.len()).min(avail);
+    let stamped = stamp_lines(src, c.next_line, b, &mut c.carry_ts, default_year);
+    c.next_line += stamped.len();
+    c.pending.extend(stamped);
+    true
+}
+
 fn merge_main(m: Arc<Merged>) {
     let (tx, rx) = mpsc::channel::<()>();
     for s in &m.sources {
@@ -158,7 +189,8 @@ fn merge_main(m: Arc<Merged>) {
         .collect();
     let mut gen = combined_generation(&m.sources);
     let mut last_wake = Instant::now();
-    const PENDING_TARGET: usize = CHUNK_ROWS * 4;
+    let target = pending_target(m.sources.len());
+    let threads = crate::par::worker_threads();
 
     loop {
         if m.cancel.load(Ordering::Acquire) {
@@ -177,50 +209,64 @@ fn merge_main(m: Arc<Merged>) {
             m.wake();
         }
 
-        // Refill pending queues.
-        let mut refilled = false;
-        for (i, src) in m.sources.iter().enumerate() {
-            let c = &mut cursors[i];
-            let avail = src.line_count();
-            if c.pending.len() < PENDING_TARGET && avail > c.next_line {
-                let b = (c.next_line + PENDING_TARGET).min(avail);
-                let stamped = stamp_lines(src, c.next_line, b, &mut c.carry_ts, default_year);
-                c.next_line += stamped.len();
-                c.pending.extend(stamped);
-                refilled = true;
-            }
+        // Top up queues that are running low, in parallel: parsing
+        // timestamps is most of the merge's work.
+        let mut low: Vec<(&Source, &mut Cursor)> = m
+            .sources
+            .iter()
+            .zip(&mut cursors)
+            .filter(|(s, c)| c.pending.len() < target / 2 && s.line_count() > c.next_line)
+            .collect();
+        let refilled = !low.is_empty();
+        if low.len() == 1 {
+            let (src, c) = &mut low[0];
+            refill(src, c, target, default_year);
+        } else if !low.is_empty() {
+            let per = low.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for part in low.chunks_mut(per) {
+                    scope.spawn(move || {
+                        for (src, c) in part {
+                            refill(src, c, target, default_year);
+                        }
+                    });
+                }
+            });
         }
 
-        // Merge while every source can participate.
+        // K-way merge on a heap of each source's next timestamp; ties go to
+        // the lower source index.  The merge stops when a source runs dry
+        // while more of it may still arrive, since its next line could
+        // sort before everything else.
+        let blocked = m
+            .sources
+            .iter()
+            .zip(&cursors)
+            .any(|(s, c)| c.pending.is_empty() && !exhausted(s, c));
         let mut emitted = Vec::new();
-        loop {
-            let mut best: Option<(i64, usize)> = None;
-            let mut blocked = false;
-            for (i, c) in cursors.iter().enumerate() {
-                match c.pending.front() {
-                    Some(&(ts, _)) => {
-                        if best.map(|(bt, _)| ts < bt).unwrap_or(true) {
-                            best = Some((ts, i));
-                        }
-                    }
-                    None => {
-                        let src = &m.sources[i];
-                        let more = src.line_count() > c.next_line;
-                        if more || !src.is_complete() {
-                            blocked = true;
-                            break;
-                        }
-                    }
+        if !blocked {
+            let mut heap: BinaryHeap<Reverse<(i64, usize)>> = cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.pending.front().map(|&(ts, _)| Reverse((ts, i))))
+                .collect();
+            while let Some(Reverse((_, i))) = heap.pop() {
+                let c = &mut cursors[i];
+                let Some((_, line)) = c.pending.pop_front() else {
+                    continue;
+                };
+                emitted.push(Row::new(line, i as SourceId, 1));
+                if c.pending.is_empty() {
+                    refill(&m.sources[i], c, target, default_year);
                 }
-            }
-            if blocked {
-                break;
-            }
-            let Some((_, i)) = best else { break };
-            let (_, line) = cursors[i].pending.pop_front().unwrap_or((0, 0));
-            emitted.push(Row::new(line, i as u8, 1));
-            if emitted.len() >= CHUNK_ROWS {
-                break;
+                match c.pending.front() {
+                    Some(&(ts, _)) => heap.push(Reverse((ts, i))),
+                    None if !exhausted(&m.sources[i], c) => break,
+                    None => {}
+                }
+                if emitted.len() >= CHUNK_ROWS {
+                    break;
+                }
             }
         }
         if !emitted.is_empty() {
@@ -236,10 +282,7 @@ fn merge_main(m: Arc<Merged>) {
             continue;
         }
 
-        let all_drained = cursors
-            .iter()
-            .zip(&m.sources)
-            .all(|(c, s)| c.pending.is_empty() && s.line_count() <= c.next_line && s.is_complete());
+        let all_drained = m.sources.iter().zip(&cursors).all(|(s, c)| exhausted(s, c));
         if all_drained {
             m.complete.store(true, Ordering::Release);
             m.wake();
@@ -281,7 +324,7 @@ mod tests {
         b.stop();
         let m = Merged::start(vec![a, b]);
         wait(&m);
-        let order: Vec<(u8, u64)> = m
+        let order: Vec<(SourceId, u64)> = m
             .rows_range(0, 100)
             .iter()
             .map(|r| (r.source(), r.line()))
@@ -301,7 +344,7 @@ mod tests {
         b.stop();
         let m = Merged::start(vec![a, b]);
         wait(&m);
-        let order: Vec<(u8, u64)> = m
+        let order: Vec<(SourceId, u64)> = m
             .rows_range(0, 10)
             .iter()
             .map(|r| (r.source(), r.line()))

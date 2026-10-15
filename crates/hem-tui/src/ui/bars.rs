@@ -81,13 +81,88 @@ pub fn title(app: &mut App, frame: &mut Frame, area: Rect) {
     ));
 }
 
+/// The range of tabs to draw: all of them when they fit, otherwise a
+/// window around the active tab that fits in `avail` columns.
+fn tab_window(widths: &[usize], active: usize, avail: usize) -> (usize, usize) {
+    let n = widths.len();
+    if widths.iter().sum::<usize>() <= avail || n == 0 {
+        return (0, n);
+    }
+    let active = active.min(n - 1);
+    let (mut lo, mut hi, mut used) = (active, active + 1, widths[active]);
+    loop {
+        let mut grew = false;
+        if hi < n && used + widths[hi] <= avail {
+            used += widths[hi];
+            hi += 1;
+            grew = true;
+        }
+        if lo > 0 && used + widths[lo - 1] <= avail {
+            lo -= 1;
+            used += widths[lo];
+            grew = true;
+        }
+        if !grew {
+            return (lo, hi);
+        }
+    }
+}
+
+/// Draw the tab bar.  When the tabs do not fit, it shows a window around
+/// the active tab with counts of the hidden ones on each side; clicking a
+/// count steps one tab that way.
 pub fn tabs(app: &mut App, frame: &mut Frame, area: Rect) {
     let theme = app.theme.clone();
+    let labels: Vec<String> = app
+        .tabs
+        .iter()
+        .map(|t| format!(" {} ", fit(&t.name, 24, app.ascii)))
+        .collect();
+    let widths: Vec<usize> = labels.iter().map(|l| l.width() + 1).collect();
+    let n = labels.len();
+    let full = (area.width as usize).saturating_sub(1);
+    let fits = widths.iter().sum::<usize>() <= full;
+    // Leave room for the two "N more" markers.
+    let avail = if fits { full } else { full.saturating_sub(18) };
+    let (lo, hi) = tab_window(&widths, app.active, avail);
+    let (left, right) = if app.ascii {
+        ("<", ">")
+    } else {
+        ("‹", "›")
+    };
+
     let mut spans = vec![Span::raw(" ")];
     let mut x = area.x + 1;
     let mut hits = Vec::new();
-    for (i, t) in app.tabs.iter().enumerate() {
-        let label = format!(" {} ", fit(&t.name, 24, app.ascii));
+    let marker = |spans: &mut Vec<Span>,
+                  hits: &mut Vec<(Rect, Hit)>,
+                  x: &mut u16,
+                  text: String,
+                  action: Action| {
+        let w = text.width() as u16;
+        spans.push(Span::styled(text, theme.dim_style()));
+        hits.push((
+            Rect {
+                x: *x,
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+            Hit::Action(action),
+        ));
+        *x += w;
+    };
+    if lo > 0 {
+        marker(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            format!("{left} {lo} more  "),
+            Action::PrevTab,
+        );
+    }
+    for (i, label) in labels.iter().enumerate().take(hi).skip(lo) {
+        let label = label.clone();
         let w = label.width() as u16;
         spans.push(Span::styled(label, theme.tab(i == app.active)));
         spans.push(Span::raw(" "));
@@ -101,6 +176,15 @@ pub fn tabs(app: &mut App, frame: &mut Frame, area: Rect) {
             Hit::Tab(i),
         ));
         x += w + 1;
+    }
+    if hi < n {
+        marker(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            format!(" {} more {right}", n - hi),
+            Action::NextTab,
+        );
     }
     let style = if theme.is_mono() {
         Style::default()

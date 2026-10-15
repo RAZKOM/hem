@@ -186,7 +186,9 @@ hem logs/*.log.gz --merge            # gzip works the same way
 
 `--merge` (or "Merge all sources by timestamp" in the palette) adds a **merged** tab that
 interleaves every file by timestamp and shows each line's source in a
-column. A merged view takes at most 256 files.
+column. A merged view takes up to 4096 files. On macOS the default limit on
+open files is 256 per process, so for more files than that raise it first:
+`ulimit -n 4096`.
 
 A workflow that works on large incidents:
 

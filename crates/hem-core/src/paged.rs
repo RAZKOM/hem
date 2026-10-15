@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -25,8 +26,19 @@ use parking_lot::Mutex;
 pub const PAGE: u64 = 64 * 1024;
 /// Pages kept in the cache (256 × 64 KiB = 16 MiB per open file).
 const CACHE_PAGES: usize = 256;
+/// Pages cached across all open files (4096 × 64 KiB = 256 MiB).  With
+/// hundreds of files open, per-file caps alone would let the caches grow
+/// to gigabytes.
+const GLOBAL_PAGES: usize = 4096;
+/// A file may always cache this many pages, whatever the global total, so
+/// a newly busy file is never starved by idle ones.
+const MIN_PAGES: usize = 16;
+/// Pages currently cached by all files.
+static CACHED: AtomicUsize = AtomicUsize::new(0);
 /// Reads at least this large go straight to the file.
 const DIRECT_READ: u64 = 256 * 1024;
+/// Pages read at once when access is sequential.
+const READ_AHEAD: u64 = 4;
 
 /// Read exactly `buf.len()` bytes at `offset`, stopping early only at end
 /// of file. Returns how many bytes were filled.
@@ -81,8 +93,18 @@ impl PageCache {
         })
     }
 
+    /// Insert a page, evicting this file's least recently used page when
+    /// the file is at its cap, or when the global budget is spent and the
+    /// file holds more than its minimum.
     fn insert(&mut self, page: u64, bytes: Arc<[u8]>) {
-        if self.pages.len() >= CACHE_PAGES && !self.pages.contains_key(&page) {
+        if self.pages.contains_key(&page) {
+            self.clock += 1;
+            self.pages.insert(page, (bytes, self.clock));
+            return;
+        }
+        let full = self.pages.len() >= CACHE_PAGES
+            || (self.pages.len() >= MIN_PAGES && CACHED.load(Ordering::Relaxed) >= GLOBAL_PAGES);
+        if full {
             if let Some(oldest) = self
                 .pages
                 .iter()
@@ -90,10 +112,18 @@ impl PageCache {
                 .map(|(k, _)| *k)
             {
                 self.pages.remove(&oldest);
+                CACHED.fetch_sub(1, Ordering::Relaxed);
             }
         }
         self.clock += 1;
         self.pages.insert(page, (bytes, self.clock));
+        CACHED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for PageCache {
+    fn drop(&mut self) {
+        CACHED.fetch_sub(self.pages.len(), Ordering::Relaxed);
     }
 }
 
@@ -183,10 +213,16 @@ impl Paged {
 
     fn page(&self, page_no: u64, page_start: u64, page_end: u64) -> Arc<[u8]> {
         let full = page_end - page_start == PAGE;
+        let mut sequential = false;
         if full {
-            if let Some(p) = self.cache.lock().get(page_no) {
+            let mut cache = self.cache.lock();
+            if let Some(p) = cache.get(page_no) {
                 return p;
             }
+            sequential = page_no > 0 && cache.pages.contains_key(&(page_no - 1));
+        }
+        if sequential {
+            return self.read_ahead(page_no, page_start);
         }
         let mut buf = vec![0u8; (page_end - page_start) as usize];
         let got = read_full_at(&self.file, &mut buf, page_start).unwrap_or(0);
@@ -198,6 +234,30 @@ impl Paged {
             self.cache.lock().insert(page_no, Arc::clone(&page));
         }
         page
+    }
+
+    /// Sequential access (the previous page is cached): read the next
+    /// `READ_AHEAD` complete pages with one call.  Building a merged view
+    /// walks every source a few lines at a time, and one 64 KiB read per
+    /// page made that several times slower than a mapping.
+    fn read_ahead(&self, page_no: u64, page_start: u64) -> Arc<[u8]> {
+        let pages = ((self.len - page_start) / PAGE).clamp(1, READ_AHEAD);
+        let mut buf = vec![0u8; (pages * PAGE) as usize];
+        let got = read_full_at(&self.file, &mut buf, page_start).unwrap_or(0) as u64;
+        let mut first: Option<Arc<[u8]>> = None;
+        let mut cache = self.cache.lock();
+        for i in 0..pages {
+            let (a, b) = (i * PAGE, (i + 1) * PAGE);
+            if b > got {
+                break;
+            }
+            let page: Arc<[u8]> = buf[a as usize..b as usize].into();
+            cache.insert(page_no + i, Arc::clone(&page));
+            first.get_or_insert(page);
+        }
+        drop(cache);
+        // A short read means the file shrank under us: return what there is.
+        first.unwrap_or_else(|| buf[..(got.min(PAGE)) as usize].into())
     }
 }
 

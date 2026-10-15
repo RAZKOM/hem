@@ -212,6 +212,9 @@ fn search_main(search: Search) {
             s.matches.write().clear();
             s.scanned.store(0, Ordering::Release);
         }
+        // "Complete" before length; see `view::builder_main`.
+        let view_done = s.view.is_complete();
+        let view_finished = s.view.is_finished();
         let avail = s.view.len();
         if avail > scanned {
             s.complete.store(false, Ordering::Release);
@@ -243,10 +246,10 @@ fn search_main(search: Search) {
             search.wake();
             continue;
         }
-        if s.view.is_complete() {
+        if view_done {
             s.complete.store(true, Ordering::Release);
             search.wake();
-            if s.view.is_finished() {
+            if view_finished {
                 break;
             }
         }

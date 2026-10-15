@@ -498,3 +498,70 @@ fn field_columns_have_a_stable_header() {
     );
     assert!(header.find("time") < header.find("level"), "{header}");
 }
+
+#[test]
+fn many_sources_merge_lazily_and_keep_the_active_tab_visible() {
+    let sources: Vec<Source> = (0..300)
+        .map(|i| {
+            Source::from_bytes(
+                format!("svc{i}.log"),
+                format!("2026-10-13 10:00:{:02}.000 INFO  hello from {i}\n", i % 60).into_bytes(),
+            )
+        })
+        .collect();
+    let opts = RunOptions {
+        sources,
+        merge: true,
+        config: Config::default(),
+        config_path: None,
+        ascii: false,
+        mouse: true,
+        theme: None,
+        initial_filter: Default::default(),
+        follow: false,
+        collapse: Some(false),
+        debug_log: None,
+    };
+    let mut app = App::new(opts).expect("app");
+    wait_view(&app);
+    assert_eq!(app.tab().name, "merged");
+    assert_eq!(app.tab().len(), 300);
+    // Per-file views are not built until their tab is shown.
+    assert!(app.tabs[..300].iter().all(|t| !t.view.is_started()));
+    let lines = render(&mut app, 120, 20);
+    let tabs = &lines[1];
+    assert!(tabs.contains("merged"), "{tabs}");
+    assert!(tabs.contains("more"), "{tabs}");
+    // Switching tabs builds that tab's view and keeps it in sight.
+    key_code(&mut app, KeyCode::BackTab);
+    app.tick();
+    assert!(app.tab().view.is_started());
+    let lines = render(&mut app, 120, 20);
+    assert!(lines[1].contains("svc299.log"), "{}", lines[1]);
+}
+
+#[test]
+fn source_picker_scrolls_to_the_selection() {
+    let sources: Vec<Source> = (0..100)
+        .map(|i| Source::from_bytes(format!("svc{i}.log"), b"x\n".to_vec()))
+        .collect();
+    let opts = RunOptions {
+        sources,
+        merge: true,
+        config: Config::default(),
+        config_path: None,
+        ascii: false,
+        mouse: true,
+        theme: None,
+        initial_filter: Default::default(),
+        follow: false,
+        collapse: Some(false),
+        debug_log: None,
+    };
+    let mut app = App::new(opts).expect("app");
+    key(&mut app, 'S');
+    let body = joined(&render(&mut app, 100, 24));
+    // The merged tab (last) is selected and scrolled into view.
+    assert!(body.contains("merged · 100 sources"), "{body}");
+    assert!(body.contains("svc99.log                2 B"), "{body}");
+}

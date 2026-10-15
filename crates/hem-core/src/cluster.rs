@@ -463,6 +463,8 @@ fn cluster_main(c: Clusters) {
             *inner.snapshot.write() = Arc::new(Vec::new());
             inner.processed.store(0, Ordering::Release);
         }
+        // "Complete" before length; see `view::builder_main`.
+        let base_done = inner.base.is_complete();
         let avail = inner.base.len();
         // Decide the stride from the first sizeable estimate of the total.
         if stride == 1 {
@@ -521,7 +523,7 @@ fn cluster_main(c: Clusters) {
             dirty = false;
             c.wake();
         }
-        if inner.base.is_complete() {
+        if base_done {
             inner.complete.store(true, Ordering::Release);
             c.wake();
             if !inner.base.is_live() {
