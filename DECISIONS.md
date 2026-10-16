@@ -161,6 +161,12 @@ needed. Items marked **review** deserve a look from the owner.
   tab bar shows a window around the active tab with "‹ N more" / "N more ›"
   markers (clickable, one tab per click); the source picker scrolls to keep
   the selection in view.
+- **The source picker filters as you type.** Every key types into the
+  filter, so closing a source moved from `d` to `Ctrl+D` (or `Delete` with
+  an empty filter). Matching is case-insensitive substrings of the name or
+  path, every space-separated term required, in tab order. Fuzzy matching
+  (as in the palette) was not used: with hundreds of names like
+  `svc12.log`, a subsequence query matches nearly all of them.
 - **The keymap is the single source of truth** for the help modal and the
   command palette; config overrides replace an action's bindings entirely.
 - **Settings auto-save** to the config file on every change (and `s` saves

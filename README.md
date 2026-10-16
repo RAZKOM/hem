@@ -84,7 +84,7 @@ The defaults (all configurable, see [Configuration](#configuration)):
 | `w` | toggle wrap |
 | `C` | toggle field columns (JSON / logfmt): a table with a header row; `←` / `→` scroll sideways |
 | `T` | cycle timestamp display (original, time, iso, local, relative) |
-| `Tab` / `Shift+Tab` | switch source tabs · `S` source picker · `o` open a file |
+| `Tab` / `Shift+Tab` | switch source tabs · `S` source picker (type to filter) · `o` open a file |
 | `L` | go to line / percentage / time (`1234`, `50%`, `10:30`, `2026-10-13T10:30:00Z`, `15m`) |
 | `:` or `Ctrl+p` | command palette |
 | `,` | settings |

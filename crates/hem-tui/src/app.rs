@@ -1333,6 +1333,7 @@ impl App {
             Action::Sources => {
                 self.modal = Some(Modal::Sources {
                     selected: self.active,
+                    filter: Input::default(),
                 })
             }
             Action::OpenFile => self.open_prompt(PromptKind::OpenFile, ""),
@@ -2068,29 +2069,47 @@ impl App {
                 KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
                 _ => {}
             },
-            Modal::Sources { selected } => {
-                let n = self.tabs.len() + 2; // tabs + "merge all" + "open file…"
+            Modal::Sources { selected, filter } => {
+                let items = self.source_matches(&filter.text);
+                let n = items.len();
                 match ev.code {
-                    KeyCode::Esc | KeyCode::Char('q') => keep = false,
-                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                        *selected = (*selected + 1) % n
+                    KeyCode::Esc if !filter.is_empty() => {
+                        filter.clear();
+                        *selected = self.active;
                     }
-                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                        *selected = (*selected + n - 1) % n
-                    }
+                    KeyCode::Esc => keep = false,
+                    KeyCode::Down | KeyCode::Tab if n > 0 => *selected = (*selected + 1) % n,
+                    KeyCode::Up | KeyCode::BackTab if n > 0 => *selected = (*selected + n - 1) % n,
+                    KeyCode::Char('n') if ctrl && n > 0 => *selected = (*selected + 1) % n,
+                    KeyCode::Char('p') if ctrl && n > 0 => *selected = (*selected + n - 1) % n,
+                    KeyCode::PageDown if n > 0 => *selected = (*selected + 10).min(n - 1),
+                    KeyCode::PageUp => *selected = selected.saturating_sub(10),
                     KeyCode::Enter => {
-                        let s = *selected;
-                        keep = false;
-                        self.source_pick(s);
-                    }
-                    KeyCode::Char('d') | KeyCode::Delete => {
-                        let s = *selected;
-                        if s < self.tabs.len() {
-                            self.close_tab(s);
-                            *selected = s.min(self.tabs.len().saturating_sub(1));
+                        if let Some(&s) = items.get(*selected) {
+                            keep = false;
+                            self.source_pick(s);
                         }
                     }
-                    _ => {}
+                    KeyCode::Char('d') if ctrl => {
+                        if let Some(&s) = items.get(*selected) {
+                            self.close_source_in_picker(s, selected, filter);
+                        }
+                    }
+                    KeyCode::Delete if filter.is_empty() => {
+                        if let Some(&s) = items.get(*selected) {
+                            self.close_source_in_picker(s, selected, filter);
+                        }
+                    }
+                    _ => {
+                        let before = filter.text.clone();
+                        edit_input(filter, &ev);
+                        if filter.text != before {
+                            // Keep the active tab selected while it still
+                            // matches; otherwise start at the top.
+                            let items = self.source_matches(&filter.text);
+                            *selected = items.iter().position(|&i| i == self.active).unwrap_or(0);
+                        }
+                    }
                 }
             }
             Modal::Detail {
@@ -2152,6 +2171,44 @@ impl App {
         if keep {
             self.modal = Some(modal);
         }
+    }
+
+    /// Source picker entries matching `query`, as indices for
+    /// `source_pick`: tabs first (in tab order), then "merge all" and
+    /// "open file".  Every whitespace-separated term must occur in the tab
+    /// name or path, ignoring case.  Substrings rather than fuzzy matching:
+    /// with hundreds of similarly named files, a subsequence matches nearly
+    /// all of them.
+    pub fn source_matches(&self, query: &str) -> Vec<usize> {
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let n = self.tabs.len();
+        let mut v: Vec<usize> = (0..n)
+            .filter(|&i| {
+                if terms.is_empty() {
+                    return true;
+                }
+                let t = &self.tabs[i];
+                let mut hay = t.name.to_lowercase();
+                if !t.base.is_merged() {
+                    if let Some(p) = t.base.sources()[0].path() {
+                        hay.push(' ');
+                        hay.push_str(&p.to_string_lossy().to_lowercase());
+                    }
+                }
+                terms.iter().all(|term| hay.contains(term.as_str()))
+            })
+            .collect();
+        v.extend([n, n + 1]);
+        v
+    }
+
+    fn close_source_in_picker(&mut self, s: usize, selected: &mut usize, filter: &Input) {
+        if s >= self.tabs.len() {
+            return;
+        }
+        self.close_tab(s);
+        let n = self.source_matches(&filter.text).len();
+        *selected = (*selected).min(n.saturating_sub(1));
     }
 
     fn source_pick(&mut self, s: usize) {
@@ -2487,9 +2544,11 @@ impl App {
                     self.toggle_setting(*item, true);
                 }
             }
-            Modal::Sources { .. } => {
-                self.modal = None;
-                self.source_pick(i);
+            Modal::Sources { filter, .. } => {
+                if let Some(&s) = self.source_matches(&filter.text).get(i) {
+                    self.modal = None;
+                    self.source_pick(s);
+                }
             }
             Modal::FilterEditor(mut st) => {
                 st.focus = i.min(FilterEditorState::FIELDS - 1);

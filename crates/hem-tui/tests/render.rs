@@ -563,5 +563,68 @@ fn source_picker_scrolls_to_the_selection() {
     let body = joined(&render(&mut app, 100, 24));
     // The merged tab (last) is selected and scrolled into view.
     assert!(body.contains("merged · 100 sources"), "{body}");
-    assert!(body.contains("svc99.log                2 B"), "{body}");
+    assert!(body.contains("svc99.log                  2 B"), "{body}");
+}
+
+#[test]
+fn source_picker_filters_as_you_type() {
+    let sources: Vec<Source> = (0..120)
+        .map(|i| {
+            let svc = if i % 2 == 0 { "api" } else { "worker" };
+            Source::from_bytes(format!("{svc}-{i}.log"), b"x\n".to_vec())
+        })
+        .collect();
+    let opts = RunOptions {
+        sources,
+        merge: false,
+        config: Config::default(),
+        config_path: None,
+        ascii: false,
+        mouse: true,
+        theme: None,
+        initial_filter: Default::default(),
+        follow: false,
+        collapse: Some(false),
+        debug_log: None,
+    };
+    let mut app = App::new(opts).expect("app");
+    key(&mut app, 'S');
+    // Letters type into the filter instead of acting as keys ('q', 'j').
+    type_text(&mut app, "WORKER -7");
+    let body = joined(&render(&mut app, 100, 30));
+    assert!(body.contains("6 of 120"), "{body}");
+    assert!(body.contains("worker-7.log"), "{body}");
+    assert!(body.contains("worker-79.log"), "{body}");
+    assert!(!body.contains("worker-17.log"), "{body}");
+    assert!(
+        !body
+            .lines()
+            .any(|l| l.contains("api-") && l.contains("· plain")),
+        "{body}"
+    );
+    assert!(app.modal.is_some());
+    // Down then Enter switches to the second match.
+    key_code(&mut app, KeyCode::Down);
+    key_code(&mut app, KeyCode::Enter);
+    assert!(app.modal.is_none());
+    assert_eq!(app.tab().name, "worker-71.log");
+
+    // Esc clears a filter before it closes the picker.
+    key(&mut app, 'S');
+    type_text(&mut app, "nothing-like-this");
+    let body = joined(&render(&mut app, 100, 30));
+    assert!(body.contains("no open source matches"), "{body}");
+    key_code(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_some());
+    let body = joined(&render(&mut app, 100, 30));
+    assert!(body.contains("120 open"), "{body}");
+    key_code(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+
+    // Ctrl+D closes the selected source.
+    key(&mut app, 'S');
+    type_text(&mut app, "api-0.");
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(app.tabs.len(), 119);
+    assert!(app.tabs.iter().all(|t| t.name != "api-0.log"));
 }

@@ -312,7 +312,9 @@ pub enum Modal {
         scroll: usize,
     },
     Sources {
+        /// Index into the matching items (see `App::source_matches`).
         selected: usize,
+        filter: Input,
     },
     Detail {
         row_idx: usize,
@@ -330,7 +332,7 @@ impl Modal {
     /// Does this modal currently own a text input?
     pub fn has_text_input(&self) -> bool {
         match self {
-            Modal::Prompt { .. } | Modal::Palette { .. } => true,
+            Modal::Prompt { .. } | Modal::Palette { .. } | Modal::Sources { .. } => true,
             Modal::FilterEditor(s) => matches!(s.focus, 0 | 1 | 2 | 4 | 5),
             _ => false,
         }

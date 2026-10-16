@@ -13,7 +13,7 @@ use hem_core::timestamp::{format_ms, TsDisplay};
 use super::logpane::{display_text, line_spans};
 use super::widgets::{block, centered, dim, fit, group, pad, wrap_spans};
 use crate::app::{App, Hit};
-use crate::modal::{FilterEditorState, Modal, SettingItem};
+use crate::modal::{FilterEditorState, Input, Modal, SettingItem};
 use crate::theme::Theme;
 
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -27,7 +27,7 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         Modal::FilterEditor(st) => filter_editor(app, frame, area, &st),
         Modal::Settings { selected } => settings(app, frame, area, selected),
         Modal::Help { scroll } => help(app, frame, area, scroll),
-        Modal::Sources { selected } => sources(app, frame, area, selected),
+        Modal::Sources { selected, filter } => sources(app, frame, area, selected, &filter),
         Modal::Detail {
             row_idx,
             row,
@@ -418,105 +418,121 @@ fn help(app: &mut App, frame: &mut Frame, area: Rect, scroll: usize) {
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-fn sources(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
-    let w = area.width.min(70);
-    let h = area.height.min((app.tabs.len() + 7) as u16);
-    let inner = frame_box(app, frame, area, "Sources", w, h);
+fn sources(app: &mut App, frame: &mut Frame, area: Rect, selected: usize, filter: &Input) {
     let theme = app.theme.clone();
+    let items = app.source_matches(&filter.text);
     let n = app.tabs.len();
-    // Items are the tabs plus two actions; they scroll so the selection
-    // stays in view (with hundreds of files open).
-    let visible = (inner.height as usize).saturating_sub(2).max(1);
+    let w = area.width.min(76);
+    // Filter line + items + blank + footer, inside the border.
+    let h = area.height.min((n + 2 + 5) as u16);
+    let inner = frame_box(app, frame, area, "Sources", w, h);
+    let lw = inner.width as usize;
+    let matched = items.len() - 2;
+    let count = if filter.is_empty() {
+        format!("{n} open ")
+    } else {
+        format!("{matched} of {n} ")
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" > ", theme.accent_style()),
+        Span::styled(
+            pad(
+                &filter.text,
+                lw.saturating_sub(3 + count.width()),
+                app.ascii,
+            ),
+            theme.input(),
+        ),
+        Span::styled(count, theme.dim_style()),
+    ])];
+    // Items scroll so the selection stays in view (with hundreds of files
+    // open).
+    if matched == 0 {
+        lines.push(Line::from(Span::styled(
+            "   no open source matches",
+            theme.dim_style(),
+        )));
+    }
+    let top = lines.len();
+    let visible = (inner.height as usize).saturating_sub(top + 2).max(1);
     let first = (selected + 1).saturating_sub(visible);
-    let shown = first..(first + visible).min(n + 2);
-    let mut lines = Vec::new();
-    for (i, t) in app.tabs.iter().enumerate() {
-        if !shown.contains(&i) {
-            continue;
-        }
-        let srcs = t.base.sources();
-        let info = if t.base.is_merged() {
-            format!("merged · {} sources", srcs.len())
-        } else {
-            let s = &srcs[0];
-            format!(
-                "{} · {} lines · {}{}",
-                super::widgets::bytes(s.total_bytes()),
-                group(s.line_count() as u64),
-                s.format(),
-                if s.is_complete() { "" } else { " · indexing" }
-            )
-        };
-        let style = if i == selected {
+    let name_w = 30.min(lw);
+    for (k, &idx) in items.iter().enumerate().skip(first).take(visible) {
+        let y = inner.y + (top + k - first) as u16;
+        let sel = k == selected;
+        let style = if sel {
             theme.selection().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let active = if i == app.active {
-            if app.ascii {
-                "*"
+        if idx < n {
+            let t = &app.tabs[idx];
+            let srcs = t.base.sources();
+            let info = if t.base.is_merged() {
+                format!("merged · {} sources", srcs.len())
             } else {
-                "●"
-            }
+                let s = &srcs[0];
+                format!(
+                    "{} · {} lines · {}{}",
+                    super::widgets::bytes(s.total_bytes()),
+                    group(s.line_count() as u64),
+                    s.format(),
+                    if s.is_complete() { "" } else { " · indexing" }
+                )
+            };
+            let active = match (idx == app.active, app.ascii) {
+                (true, true) => "*",
+                (true, false) => "●",
+                _ => " ",
+            };
+            let text = pad(&format!(" {active} {}  ", t.name), name_w, app.ascii);
+            lines.push(Line::from(vec![
+                Span::styled(text, style),
+                Span::styled(
+                    fit(&info, lw.saturating_sub(name_w), app.ascii),
+                    if sel { style } else { theme.dim_style() },
+                ),
+            ]));
         } else {
-            " "
-        };
-        let lw = inner.width as usize;
-        let text = pad(&format!(" {active} {}  ", t.name), 28.min(lw), app.ascii);
-        lines.push(Line::from(vec![
-            Span::styled(text, style),
-            Span::styled(
-                fit(&info, lw.saturating_sub(28), app.ascii),
-                if i == selected {
-                    style
-                } else {
-                    theme.dim_style()
-                },
-            ),
-        ]));
-        app.hits.push((
-            Rect {
-                x: inner.x,
-                y: inner.y + (i - first) as u16,
-                width: inner.width,
-                height: 1,
-            },
-            Hit::ModalItem(i),
-        ));
-    }
-    let extra = [
-        ("merge all sources by timestamp", n),
-        ("open another file…", n + 1),
-    ];
-    for (label, idx) in extra {
-        if !shown.contains(&idx) {
-            continue;
+            let label = if idx == n {
+                "merge all sources by timestamp"
+            } else {
+                "open another file…"
+            };
+            let style = if sel { style } else { theme.accent_style() };
+            lines.push(Line::from(Span::styled(
+                pad(&format!("   + {label}"), lw, app.ascii),
+                style,
+            )));
         }
-        let style = if idx == selected {
-            theme.selection().add_modifier(Modifier::BOLD)
-        } else {
-            theme.accent_style()
-        };
-        lines.push(Line::from(Span::styled(
-            pad(&format!("   + {label}"), inner.width as usize, app.ascii),
-            style,
-        )));
         app.hits.push((
             Rect {
                 x: inner.x,
-                y: inner.y + (idx - first) as u16,
+                y,
                 width: inner.width,
                 height: 1,
             },
-            Hit::ModalItem(idx),
+            Hit::ModalItem(k),
         ));
     }
-    lines.push(Line::from(""));
+    while lines.len() + 1 < inner.height as usize {
+        lines.push(Line::from(""));
+    }
     lines.push(footer(
         &theme,
-        " Enter switch · d close source · Tab in the main view also switches",
+        " type to filter · Enter switch · Ctrl+D close source · Esc clear / close",
     ));
+    let cursor: usize = filter
+        .text
+        .chars()
+        .take(filter.cursor)
+        .map(|c| c.to_string().width())
+        .sum();
     frame.render_widget(Paragraph::new(lines), inner);
+    frame.set_cursor_position((
+        inner.x + 3 + (cursor as u16).min(inner.width.saturating_sub(4)),
+        inner.y,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
