@@ -112,6 +112,7 @@ pub enum PromptKind {
     OpenFile,
     Highlight,
     Goto,
+    SessionName,
 }
 
 impl PromptKind {
@@ -124,6 +125,7 @@ impl PromptKind {
             PromptKind::OpenFile => "open",
             PromptKind::Highlight => "* highlight",
             PromptKind::Goto => "go to",
+            PromptKind::SessionName => "save session",
         }
     }
 
@@ -136,6 +138,9 @@ impl PromptKind {
             PromptKind::OpenFile => "path to a log file (.gz ok)",
             PromptKind::Highlight => "value to highlight (request id, thread, trace id…)",
             PromptKind::Goto => "line number · 50% · timestamp (10:30, 2026-10-13T10:30:00Z, 5m)",
+            PromptKind::SessionName => {
+                "name (letters, digits, . _ -) · reopen with: hem --session NAME"
+            }
         }
     }
 }
@@ -202,10 +207,11 @@ pub enum SettingItem {
     Minimap,
     Mouse,
     Ascii,
+    ConfirmQuit,
 }
 
 impl SettingItem {
-    pub const ALL: [SettingItem; 9] = [
+    pub const ALL: [SettingItem; 10] = [
         SettingItem::Theme,
         SettingItem::Collapse,
         SettingItem::Timestamp,
@@ -215,6 +221,7 @@ impl SettingItem {
         SettingItem::Minimap,
         SettingItem::Mouse,
         SettingItem::Ascii,
+        SettingItem::ConfirmQuit,
     ];
 
     pub fn label(self) -> &'static str {
@@ -228,6 +235,7 @@ impl SettingItem {
             SettingItem::Minimap => "Timeline minimap",
             SettingItem::Mouse => "Mouse support",
             SettingItem::Ascii => "ASCII box drawing",
+            SettingItem::ConfirmQuit => "Confirm before quitting",
         }
     }
 }

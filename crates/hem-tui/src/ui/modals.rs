@@ -317,6 +317,7 @@ fn settings(app: &mut App, frame: &mut Frame, area: Rect, selected: usize) {
             SettingItem::Minimap => onoff(app.config.defaults.minimap),
             SettingItem::Mouse => onoff(app.config.defaults.mouse),
             SettingItem::Ascii => onoff(app.config.defaults.ascii),
+            SettingItem::ConfirmQuit => onoff(app.config.defaults.confirm_quit),
         };
         let lw = (inner.width as usize).saturating_sub(16);
         let style = if i == selected {
@@ -406,6 +407,15 @@ fn help(app: &mut App, frame: &mut Frame, area: Rect, scroll: usize) {
         "   pinned lines stay in a strip above the log, however far you scroll",
         "   the minimap marks them; click a pinned line to jump to it",
         "   pins survive filter changes; hidden ones show as \"filtered out\"",
+    ] {
+        lines.push(Line::from(Span::raw(l)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Sessions", theme.title_style())));
+    for l in [
+        "   quitting saves files, filters, pins and positions: hem --resume reopens them",
+        "   Ctrl+s saves under a name: hem --session NAME reopens it later",
+        "   hem sessions lists saved sessions",
     ] {
         lines.push(Line::from(Span::raw(l)));
     }

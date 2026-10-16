@@ -161,6 +161,24 @@ needed. Items marked **review** deserve a look from the owner.
   tab bar shows a window around the active tab with "‹ N more" / "N more ›"
   markers (clickable, one tab per click); the source picker scrolls to keep
   the selection in view.
+- **Sessions save on every quit.** The state goes to a session named
+  `last` (plus the named one, if any), so `hem --resume` makes quitting
+  cheap. That is why confirming quit is an opt-in setting rather than the
+  default, and why `Esc` alone no longer quits (it is the key people press
+  once too often while backing out of modals).
+- **Sessions refer to lines by path and line number**, with a fingerprint
+  per file (size, FNV-1a of the first 4 KiB). Appending keeps pins valid; a
+  shorter file or different head drops that file's pins with a notice. A
+  content hash per pinned line was considered and set aside: it would
+  re-find pins after rotation, but rotated logs rarely contain the same
+  lines anyway.
+- **Command line beats session.** Files given on the command line replace
+  the session's list (state still applies by path), and filter flags or
+  `-f` replace the saved filters / follow. Relative times are stored as
+  absolute instants. Only tabs that were shown or carry state are saved,
+  so a 300-file session stays small. Template filters are stored as their
+  displayed tokens; a literal token that is exactly `<*>` would come back
+  as a wildcard.
 - **The source picker filters as you type.** Every key types into the
   filter, so closing a source moved from `d` to `Ctrl+D` (or `Delete` with
   an empty filter). Matching is case-insensitive substrings of the name or

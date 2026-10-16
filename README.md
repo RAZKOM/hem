@@ -50,6 +50,9 @@ hem app.log -f                      # follow (tail -F), survives rotation
 hem app.log --since 15m --level warn --filter timeout
 hem app.log --level error --plain | wc -l
 hem templates app.log               # most common line templates, as a table
+hem --resume                        # reopen the last session where you left off
+hem 'logs/*.log' -m --session inc   # a named session, saved on quit
+hem sessions                        # list saved sessions
 ```
 
 Inside the TUI press `?` for help, `:` for the command palette.
@@ -89,7 +92,9 @@ The defaults (all configurable, see [Configuration](#configuration)):
 | `:` or `Ctrl+p` | command palette |
 | `,` | settings |
 | `?` | help (generated from the live keymap) |
-| `q` / `Esc` | close modal / leave templates view / quit |
+| `Ctrl+s` | save the session (files, filters, pins, positions) under a name |
+| `Esc` | close modal / leave templates view (never quits) |
+| `q` | close modal / leave templates view / quit |
 
 Everything is clickable too: tabs, filter chips (click ✕ to remove one),
 rows (click to select, click again for detail), pinned lines (click to jump),
@@ -139,6 +144,35 @@ found in ISO 8601 / RFC 3339, `YYYY-MM-DD HH:MM:SS[,fff]`, `YYYY/MM/DD`,
 syslog, Apache/nginx bracket form and epoch seconds/millis/micros/nanos
 (including JSON `time`/`ts`/`timestamp`/`@timestamp` fields).
 
+## Sessions
+
+Every time hem quits it saves the session: the files, which tab was
+active, and for each tab its filters, pins, search, highlight and cursor
+position. `hem --resume` (`-r`) reopens it where you left off.
+
+To keep a session for longer, give it a name. `hem 'logs/*.log' -m
+--session incident-42` saves under that name on quit, and running
+`hem --session incident-42` later, with no files, reopens the same files.
+`Ctrl+s` inside the TUI saves under a name at any point.
+
+- Files given on the command line win over the session's list; the saved
+  state applies to whichever of them it covers. Filter flags and `-f` on
+  the command line also win over the saved filters and follow mode.
+- Relative times (`--since 15m`) are saved as the instant they meant, so a
+  session reopened tomorrow shows the same window.
+- Pins and positions are line numbers. If a file was rotated or rewritten
+  since the save (it is shorter, or its first 4 KiB differ), its pins are
+  dropped with a notice instead of landing on unrelated lines. Files that
+  only grew keep theirs.
+- `hem sessions` lists saved sessions; `hem sessions --delete NAME`
+  removes one. They are small TOML files in `%LOCALAPPDATA%\hem\sessions`
+  on Windows and `~/.local/state/hem/sessions` elsewhere
+  (`$XDG_STATE_HOME` and `HEM_SESSION_DIR` override). stdin is not saved.
+
+Since an accidental quit costs nothing more than `hem -r`, hem quits on the
+first `q`. Set `confirm_quit = true` (or toggle it in settings, `,`) to
+need a second press. `Esc` never quits; it only backs out of things.
+
 ## Plain mode
 
 When stdout is not a terminal, or with `--plain`, hem prints lines instead
@@ -186,7 +220,7 @@ quit = "ctrl+q"
 #   toggle_collapse expand templates detail pin next_pin prev_pin clear_pins highlight_value
 #   clear_highlight copy copy_view
 #   toggle_wrap toggle_columns cycle_timestamp next_tab prev_tab sources open_file goto palette
-#   settings help close quit sort_templates sort_templates_reverse refresh
+#   settings help close quit sort_templates sort_templates_reverse refresh save_session
 
 [defaults]
 collapse = true           # collapse repeated lines
@@ -197,6 +231,7 @@ ascii = false             # ASCII box drawing / symbols
 mouse = true
 columns = false           # field columns for JSON/logfmt sources
 minimap = true
+confirm_quit = false      # q must be pressed twice to quit
 cluster_cap = 2000000     # lines sampled for templates (0 = all)
 
 [presets.errors]          # hem --preset errors, or "Preset: errors" in the palette

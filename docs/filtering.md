@@ -206,6 +206,9 @@ A workflow that works on large incidents:
    the current filters hide stays in the strip, marked "filtered out".
 5. **Loosen and compare.** `X` clears the filters but keeps your pins, so
    you can see what happened around them.
+6. **Keep it.** `Ctrl+s` saves the session under a name (files, filters,
+   pins, positions); `hem --session NAME` reopens it tomorrow. Even without
+   a name, `hem --resume` reopens wherever the last run left off.
 
 The same filters work outside the TUI, which is handy for sharing or
 counting:

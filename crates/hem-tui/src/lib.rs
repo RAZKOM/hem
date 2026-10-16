@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod config;
 pub mod keymap;
 pub mod modal;
+pub mod session;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
@@ -38,6 +39,10 @@ pub struct RunOptions {
     pub follow: bool,
     pub collapse: Option<bool>,
     pub debug_log: Option<PathBuf>,
+    /// Session to save to on quit (besides `session::LAST`).
+    pub session_name: Option<String>,
+    /// Saved state to restore.
+    pub session: Option<session::Session>,
 }
 
 /// Run the full-screen application until the user quits.
@@ -63,6 +68,11 @@ pub fn run(opts: RunOptions) -> Result<()> {
     ));
     let result = event_loop(&mut term, &mut app);
     terminal::restore();
+    match app.save_session_on_exit() {
+        Ok(Some(name)) => eprintln!("hem: session {name} saved (reopen: hem --session {name})"),
+        Ok(None) => {}
+        Err(e) => eprintln!("hem: could not save the session: {e:#}"),
+    }
     result
 }
 

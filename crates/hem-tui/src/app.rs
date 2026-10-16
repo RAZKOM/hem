@@ -29,11 +29,15 @@ use crate::keymap::{Action, Key, KeyMap};
 use crate::modal::{
     FilterEditorState, Input, Modal, PromptKind, SettingItem, TemplateSort, TemplatesState,
 };
+use crate::session::{self, LineRef, Session, TabState};
 use crate::theme::{Depth, Theme};
 use crate::RunOptions;
 
 /// Maximum lines expanded inline for a collapsed run.
 pub const MAX_EXPAND: usize = 500;
+/// With "confirm before quitting" on, the second quit press must come
+/// within this long of the first.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
 /// Something clickable, recorded during render.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -621,6 +625,10 @@ pub struct App {
     cluster_cap: usize,
     pub palette_items: Vec<PaletteItem>,
     pub wake: Arc<dyn Fn() + Send + Sync>,
+    /// Named session saved on quit (every quit also saves `session::LAST`).
+    pub session_name: Option<String>,
+    /// When quit was last pressed, with "confirm before quitting" on.
+    quit_armed: Option<Instant>,
 }
 
 impl std::fmt::Debug for App {
@@ -726,6 +734,8 @@ impl App {
             },
             palette_items: Vec::new(),
             wake,
+            session_name: opts.session_name.clone(),
+            quit_armed: None,
         };
         if opts.merge && opts.sources.len() > 1 {
             app.add_merged_tab(opts.sources.clone(), filter.clone(), collapse, follow);
@@ -740,8 +750,220 @@ impl App {
         if app.tabs.is_empty() {
             anyhow::bail!("no sources");
         }
+        if let Some(s) = &opts.session {
+            // Filters or --follow given on the command line beat saved ones.
+            app.apply_session(s, !opts.initial_filter.is_empty(), opts.follow);
+        }
         app.tab().view.resume();
         Ok(app)
+    }
+
+    // --- Sessions -------------------------------------------------------
+
+    /// Session key of a tab: its file's absolute path, or `merged`.
+    fn tab_key(t: &Tab) -> Option<String> {
+        if t.base.is_merged() {
+            Some(session::MERGED.to_string())
+        } else {
+            t.base.sources()[0].path().map(session::absolute)
+        }
+    }
+
+    /// Restore saved tab state onto the open tabs.  Tabs are matched by
+    /// file path; pins and positions in files that changed since the save
+    /// are dropped.
+    pub fn apply_session(&mut self, s: &Session, keep_filters: bool, follow: bool) {
+        let changed: HashSet<String> = s.changed_files().into_iter().collect();
+        let mut dropped = 0usize;
+        let wake = Arc::clone(&self.wake);
+        let mut errors = Vec::new();
+        for t in &mut self.tabs {
+            let Some(key) = Self::tab_key(t) else {
+                continue;
+            };
+            let Some(st) = s.tab(&key) else {
+                continue;
+            };
+            // Source ids by path for this tab's base.
+            let ids: HashMap<String, SourceId> = t
+                .base
+                .sources()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, src)| Some((session::absolute(src.path()?), i as SourceId)))
+                .collect();
+            let resolve = |r: &LineRef| -> Option<(SourceId, u64)> {
+                if changed.contains(&r.file) {
+                    return None;
+                }
+                ids.get(&r.file).map(|&id| (id, r.line))
+            };
+            if !keep_filters {
+                match Filter::from_spec(&st.filter) {
+                    Ok(mut f) => {
+                        f.template = st.template();
+                        t.filter = f;
+                    }
+                    Err(e) => errors.push(format!("{}: {e}", t.name)),
+                }
+            }
+            t.collapse = st.collapse;
+            t.wrap = st.wrap;
+            t.columns = st.columns;
+            t.follow = st.follow || follow;
+            t.view.cancel();
+            t.view = View::deferred(
+                t.base.clone(),
+                ViewSpec {
+                    filter: t.filter.clone(),
+                    collapse: t.collapse,
+                },
+            );
+            t.view.add_waker(Arc::clone(&wake));
+            t.view_gen = t.view.generation();
+            // Searches start when the tab is first shown (see `tick`).
+            t.search_text = st.search.clone();
+            t.highlight = (!st.highlight.is_empty())
+                .then(|| Matcher::new(&st.highlight, true).ok())
+                .flatten();
+            t.pins = st.pins.iter().filter_map(resolve).collect();
+            dropped += st.pins.len() - t.pins.len();
+            t.invalidate_pins();
+            if !t.follow {
+                t.pending_anchor = st.cursor.as_ref().and_then(resolve);
+            }
+        }
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| Self::tab_key(t).as_deref() == Some(s.active.as_str()))
+        {
+            self.active = i;
+        }
+        for e in errors {
+            self.notice_warn(format!("session: {e}"));
+        }
+        if dropped > 0 {
+            self.notice_warn(format!(
+                "session: {dropped} pin(s) dropped; their file changed since it was saved"
+            ));
+        }
+    }
+
+    /// The current state as a session.  Tabs that were never shown and
+    /// carry nothing worth keeping are left out.
+    pub fn session_snapshot(&self) -> Session {
+        let mut s = Session {
+            merge: self.tabs.iter().any(|t| t.base.is_merged()),
+            active: Self::tab_key(self.tab()).unwrap_or_default(),
+            name: self
+                .session_name
+                .clone()
+                .filter(|n| n != session::LAST)
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let mut seen = HashSet::new();
+        for t in &self.tabs {
+            for src in t.base.sources() {
+                if let Some(p) = src.path() {
+                    let a = session::absolute(p);
+                    if seen.insert(a.clone()) {
+                        s.files.push(session::FileEntry::new(&a));
+                    }
+                }
+            }
+        }
+        for t in &self.tabs {
+            let Some(key) = Self::tab_key(t) else {
+                continue;
+            };
+            let worth = t.view.is_started()
+                || !t.filter.is_empty()
+                || !t.pins.is_empty()
+                || !t.search_text.is_empty()
+                || t.highlight.is_some()
+                || t.pending_anchor.is_some();
+            if !worth {
+                continue;
+            }
+            let path_of = |id: SourceId| -> Option<String> {
+                t.base
+                    .sources()
+                    .get(id as usize)
+                    .and_then(|src| src.path())
+                    .map(session::absolute)
+            };
+            let line_ref = |(id, line): (SourceId, u64)| -> Option<LineRef> {
+                path_of(id).map(|file| LineRef { file, line })
+            };
+            let mut spec = t.filter.spec.clone();
+            // Relative times ("15m") are saved as the instant they meant.
+            let fmt = |ms: i64| timestamp::format_ms(ms, TsDisplay::Iso, None);
+            spec.since = t.filter.since.map(fmt);
+            spec.until = t.filter.until.map(fmt);
+            let cursor = t
+                .pending_anchor
+                .or_else(|| t.view.row(t.cursor).map(|r| (r.source(), r.line())));
+            let mut st = TabState {
+                key,
+                filter: spec,
+                collapse: t.collapse,
+                wrap: t.wrap,
+                columns: t.columns,
+                follow: t.follow,
+                search: t.search_text.clone(),
+                highlight: t
+                    .highlight
+                    .as_ref()
+                    .map(|m| m.text.clone())
+                    .unwrap_or_default(),
+                cursor: cursor.and_then(line_ref),
+                pins: t.pins.iter().copied().filter_map(line_ref).collect(),
+                ..Default::default()
+            };
+            st.set_template(t.filter.template.as_ref());
+            s.tabs.push(st);
+        }
+        s
+    }
+
+    /// Save under `name` (and remember it as this session's name).
+    pub fn save_session_as(&mut self, name: &str) {
+        let prev = self.session_name.replace(name.to_string());
+        let snap = self.session_snapshot();
+        let result = if snap.files.is_empty() {
+            Err(anyhow::anyhow!(
+                "nothing to save: sessions need files (not stdin)"
+            ))
+        } else {
+            session::save(name, &snap)
+        };
+        match result {
+            Ok(_) => self.notice(format!("session saved · reopen with: hem --session {name}")),
+            Err(e) => {
+                self.session_name = prev;
+                self.notice_warn(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Save on quit: the named session if there is one, and always
+    /// `session::LAST` (for `hem --resume`).  Returns the named session's
+    /// name when it was saved.
+    pub fn save_session_on_exit(&self) -> Result<Option<String>> {
+        let snap = self.session_snapshot();
+        if snap.files.is_empty() {
+            return Ok(None);
+        }
+        session::save(session::LAST, &snap)?;
+        match &self.session_name {
+            Some(n) if n != session::LAST => {
+                session::save(n, &snap)?;
+                Ok(Some(n.clone()))
+            }
+            _ => Ok(None),
+        }
     }
 
     // --- Accessors ------------------------------------------------------
@@ -819,6 +1041,14 @@ impl App {
 
     pub fn tick(&mut self) {
         self.tab().view.resume();
+        // A search restored from a session starts when its tab is shown.
+        if self.tab().search.is_none() && !self.tab().search_text.is_empty() {
+            let pat = self.tab().search_text.clone();
+            self.start_search(&pat);
+            if self.tab().search.is_none() {
+                self.tab_mut().search_text.clear();
+            }
+        }
         let now = Instant::now();
         let before = self.notices.len();
         self.notices.retain(|n| n.until > now);
@@ -1347,7 +1577,10 @@ impl App {
                 } else if self.templates_mode {
                     self.templates_mode = false;
                 } else {
-                    self.quit = true;
+                    // Esc is pressed to back out of things, often once too
+                    // often, so on its own it does not quit.
+                    let keys = self.keymap.keys_label(Action::Quit, self.ascii);
+                    self.notice(format!("{keys} quits"));
                 }
             }
             Action::Quit => {
@@ -1355,9 +1588,25 @@ impl App {
                     self.modal = None;
                 } else if self.templates_mode {
                     self.templates_mode = false;
+                } else if self.config.defaults.confirm_quit
+                    && !self
+                        .quit_armed
+                        .is_some_and(|t| t.elapsed() < QUIT_CONFIRM_WINDOW)
+                {
+                    self.quit_armed = Some(Instant::now());
+                    let keys = self.keymap.keys_label(Action::Quit, self.ascii);
+                    self.notice(format!("press {keys} again to quit"));
                 } else {
                     self.quit = true;
                 }
+            }
+            Action::SaveSession => {
+                let name = self
+                    .session_name
+                    .clone()
+                    .filter(|n| n != session::LAST)
+                    .unwrap_or_default();
+                self.open_prompt(PromptKind::SessionName, &name);
             }
             Action::SortTemplates => {
                 let t = self.tab_mut();
@@ -2290,6 +2539,9 @@ impl App {
                 self.config.defaults.ascii = !self.config.defaults.ascii;
                 self.ascii = self.config.defaults.ascii;
             }
+            SettingItem::ConfirmQuit => {
+                self.config.defaults.confirm_quit = !self.config.defaults.confirm_quit;
+            }
         }
         self.save_config();
     }
@@ -2348,6 +2600,15 @@ impl App {
                 }
             }
             PromptKind::Goto => self.goto(text),
+            PromptKind::SessionName => {
+                if text.is_empty() {
+                    return;
+                }
+                match session::check_name(text) {
+                    Ok(()) => self.save_session_as(text),
+                    Err(e) => self.notice_warn(e.to_string()),
+                }
+            }
         }
     }
 

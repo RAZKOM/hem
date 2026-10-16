@@ -322,3 +322,61 @@ fn merging_many_files_prints_every_line() {
         assert_eq!(out.lines().count(), 12 * 20_000);
     }
 }
+
+#[test]
+fn sessions_list_resume_and_reopen_files_in_plain_mode() {
+    let dir = std::env::temp_dir().join(format!("hem-cli-sessions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("store");
+    let with_store = |args: &[&str]| {
+        let out = hem()
+            .args(args)
+            .env("NO_COLOR", "1")
+            .env("HEM_SESSION_DIR", &store)
+            .output()
+            .expect("run hem");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, out, _) = with_store(&["sessions"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("no saved sessions"), "{out}");
+    let (code, _, err) = with_store(&["--resume", "--plain"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("no session to resume"), "{err}");
+
+    // A session file as the TUI writes it; plain mode reopens its files.
+    let log = testdata("sample-plain.log");
+    let gone = dir.join("rotated-away.log");
+    std::fs::create_dir_all(&store).unwrap();
+    let toml = format!(
+        "version = 1\nsaved = \"2026-10-15 09:00:00\"\nmerge = false\nactive = \"\"\n\n\
+         [[files]]\npath = {:?}\n\n[[files]]\npath = {:?}\n",
+        log.to_string_lossy(),
+        gone.to_string_lossy()
+    );
+    std::fs::write(store.join("inc.toml"), toml).unwrap();
+    let (code, out, _) = with_store(&["sessions"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("inc") && out.contains("sample-plain.log"),
+        "{out}"
+    );
+    let (code, out, err) = with_store(&["--session", "inc", "--level", "error", "--plain"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.lines().count(), 10, "{out}");
+    assert!(err.contains("missing, skipped"), "{err}");
+
+    let (code, _, err) = with_store(&["--session", "../x", "--plain"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("bad session name"), "{err}");
+    let (code, out, _) = with_store(&["sessions", "--delete", "inc"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("deleted"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

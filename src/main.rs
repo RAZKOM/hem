@@ -26,7 +26,10 @@ use hem_tui::config::Config;
     cat app.log | hem                 read from stdin
     hem app.log --level error --plain | wc -l
     hem app.log --since 15m --filter timeout --follow
-    hem templates app.log             print the most common line templates")]
+    hem templates app.log             print the most common line templates
+    hem --resume                      reopen the last session where you left off
+    hem 'logs/*.log' -m -s incident   a named session: saved on quit, reopened by name
+    hem sessions                      list saved sessions")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -39,6 +42,15 @@ struct Cli {
 enum Command {
     /// Print the most common line templates of a file as a table.
     Templates(templates_cmd::TemplatesArgs),
+    /// List saved sessions, or delete one.
+    Sessions(SessionsArgs),
+}
+
+#[derive(Args, Debug)]
+struct SessionsArgs {
+    /// Delete this session.
+    #[arg(long, value_name = "NAME")]
+    delete: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -129,6 +141,16 @@ struct ViewArgs {
     #[arg(long)]
     color: bool,
 
+    /// Save this session under NAME when hem quits, and restore it when it
+    /// exists: its files (unless FILES are given), filters, pins, searches
+    /// and positions.
+    #[arg(short = 's', long, value_name = "NAME", conflicts_with = "resume")]
+    session: Option<String>,
+
+    /// Reopen the last session (every quit saves one).
+    #[arg(short = 'r', long)]
+    resume: bool,
+
     /// Memory-map files instead of reading them through a page cache.
     /// Slightly faster on huge static files, but while hem runs, other
     /// programs can't truncate the file on Windows, and a truncation can
@@ -152,6 +174,9 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode> {
     if let Some(Command::Templates(args)) = cli.command {
         return templates_cmd::run(args, cli.view.config.as_deref());
+    }
+    if let Some(Command::Sessions(a)) = &cli.command {
+        return sessions_cmd(a);
     }
     let args = cli.view;
     let (mut config, config_path) = Config::load(args.config.as_deref())?;
@@ -233,8 +258,48 @@ fn run(cli: Cli) -> Result<ExitCode> {
         config.defaults.ascii = true;
     }
 
+    // Session: restore its state, and its files when none are given.
+    let session_name = if args.resume {
+        Some(hem_tui::session::LAST.to_string())
+    } else {
+        args.session.clone()
+    };
+    let saved = match &session_name {
+        Some(n) => {
+            hem_tui::session::check_name(n)?;
+            hem_tui::session::load(n)?
+        }
+        None => None,
+    };
+    if args.resume && saved.is_none() {
+        return Err(anyhow!(
+            "no session to resume yet (one is saved each time hem quits)"
+        ));
+    }
+    // Resuming continues the named session the last run belonged to.
+    let session_name = match (&saved, args.resume) {
+        (Some(s), true) if !s.name.is_empty() => Some(s.name.clone()),
+        _ => session_name,
+    };
+    let merge = args.merge || saved.as_ref().is_some_and(|s| s.merge);
     // Sources.
-    let paths = expand_globs(&args.files)?;
+    let mut paths = expand_globs(&args.files)?;
+    if paths.is_empty() {
+        if let Some(s) = &saved {
+            let (found, missing): (Vec<_>, Vec<_>) = s
+                .files
+                .iter()
+                .map(|f| PathBuf::from(&f.path))
+                .partition(|p| p.exists());
+            for p in &missing {
+                eprintln!("hem: session file missing, skipped: {}", p.display());
+            }
+            if found.is_empty() {
+                return Err(anyhow!("none of the session's files exist any more"));
+            }
+            paths = found;
+        }
+    }
     let source_opts = SourceOptions {
         follow: args.follow || !plain_mode,
         format: format_override,
@@ -270,7 +335,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // Plain output only collapses when asked, so `| wc -l` counts lines.
             collapse: collapse.unwrap_or(false),
             follow: args.follow,
-            merge: args.merge,
+            merge,
             color: args.color
                 || (std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()),
         };
@@ -279,7 +344,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let run_opts = hem_tui::RunOptions {
         sources,
-        merge: args.merge,
+        merge,
         config,
         config_path,
         ascii: args.ascii,
@@ -289,6 +354,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         follow: args.follow,
         collapse,
         debug_log: args.debug,
+        session_name,
+        session: saved,
     };
     hem_tui::run(run_opts)?;
     Ok(ExitCode::SUCCESS)
@@ -319,4 +386,41 @@ pub fn expand_globs(args: &[String]) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(out)
+}
+
+/// `hem sessions`: list saved sessions, or delete one.
+fn sessions_cmd(args: &SessionsArgs) -> Result<ExitCode> {
+    use hem_tui::session;
+    if let Some(name) = &args.delete {
+        if session::delete(name)? {
+            println!("deleted session {name}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Err(anyhow!("no session named {name:?}"));
+    }
+    let all = session::list()?;
+    if all.is_empty() {
+        println!(
+            "no saved sessions yet; hem saves one each time it quits (reopen with hem --resume)"
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let w = all.iter().map(|(n, _)| n.len()).max().unwrap_or(4).max(4);
+    println!(
+        "{:<w$}  {:<19}  {:>5}  {:>4}  FIRST FILE",
+        "NAME", "SAVED (UTC)", "FILES", "PINS"
+    );
+    for (name, s) in &all {
+        let pins: usize = s.tabs.iter().map(|t| t.pins.len()).sum();
+        let first = s.files.first().map(|f| f.path.as_str()).unwrap_or("");
+        println!(
+            "{name:<w$}  {:<19}  {:>5}  {pins:>4}  {first}",
+            s.saved,
+            s.files.len()
+        );
+    }
+    if let Some(d) = session::dir() {
+        println!("\nstored in {}", d.display());
+    }
+    Ok(ExitCode::SUCCESS)
 }

@@ -37,6 +37,8 @@ fn app_with(text: &str, collapse: bool) -> App {
         follow: false,
         collapse: Some(collapse),
         debug_log: None,
+        session_name: None,
+        session: None,
     };
     let app = App::new(opts).expect("app");
     wait_view(&app);
@@ -341,6 +343,8 @@ fn ascii_mode_renders_without_box_drawing() {
         follow: false,
         collapse: Some(true),
         debug_log: None,
+        session_name: None,
+        session: None,
     };
     let mut app = App::new(opts).unwrap();
     wait_view(&app);
@@ -366,6 +370,8 @@ fn follow_sticks_to_bottom_as_source_grows() {
         follow: true,
         collapse: Some(false),
         debug_log: None,
+        session_name: None,
+        session: None,
     };
     let mut app = App::new(opts).unwrap();
     wait_view(&app);
@@ -521,6 +527,8 @@ fn many_sources_merge_lazily_and_keep_the_active_tab_visible() {
         follow: false,
         collapse: Some(false),
         debug_log: None,
+        session_name: None,
+        session: None,
     };
     let mut app = App::new(opts).expect("app");
     wait_view(&app);
@@ -557,6 +565,8 @@ fn source_picker_scrolls_to_the_selection() {
         follow: false,
         collapse: Some(false),
         debug_log: None,
+        session_name: None,
+        session: None,
     };
     let mut app = App::new(opts).expect("app");
     key(&mut app, 'S');
@@ -586,6 +596,8 @@ fn source_picker_filters_as_you_type() {
         follow: false,
         collapse: Some(false),
         debug_log: None,
+        session_name: None,
+        session: None,
     };
     let mut app = App::new(opts).expect("app");
     key(&mut app, 'S');

@@ -31,6 +31,8 @@ pub struct Defaults {
     pub columns: bool,
     /// Show the timeline minimap.
     pub minimap: bool,
+    /// Ask for a second press of the quit key before quitting.
+    pub confirm_quit: bool,
     /// Lines sampled for template clustering (0 = unlimited).
     pub cluster_cap: usize,
 }
@@ -46,6 +48,7 @@ impl Default for Defaults {
             mouse: true,
             columns: false,
             minimap: true,
+            confirm_quit: false,
             cluster_cap: 2_000_000,
         }
     }

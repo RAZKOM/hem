@@ -62,6 +62,7 @@ pub enum Action {
     SortTemplates,
     SortTemplatesReverse,
     Refresh,
+    SaveSession,
 }
 
 /// Grouping used by the help modal.
@@ -89,7 +90,7 @@ impl Category {
 }
 
 impl Action {
-    pub const ALL: [Action; 51] = [
+    pub const ALL: [Action; 52] = [
         Action::ScrollUp,
         Action::ScrollDown,
         Action::ScrollLeft,
@@ -141,6 +142,7 @@ impl Action {
         Action::SortTemplates,
         Action::SortTemplatesReverse,
         Action::Refresh,
+        Action::SaveSession,
     ];
 
     pub fn label(self) -> &'static str {
@@ -196,6 +198,7 @@ impl Action {
             Action::SortTemplates => "Templates: cycle sort column",
             Action::SortTemplatesReverse => "Templates: reverse sort",
             Action::Refresh => "Re-check file now",
+            Action::SaveSession => "Save session (files, filters, pins)",
         }
     }
 
@@ -215,7 +218,7 @@ impl Action {
             | SortTemplatesReverse => Category::Insight,
             ToggleWrap | ToggleColumns | CycleTimestamp => Category::View,
             Copy | CopyView | Sources | OpenFile | Palette | Settings | Help | Close | Quit
-            | Refresh => Category::App,
+            | Refresh | SaveSession => Category::App,
         }
     }
 
@@ -463,6 +466,7 @@ impl Default for KeyMap {
             (Key::ch('s'), SortTemplates),
             (Key::ch('r'), SortTemplatesReverse),
             (Key::ch('R'), Refresh),
+            (Key::ctrl('s'), SaveSession),
         ];
         KeyMap { bindings: b }
     }
