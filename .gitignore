@@ -4,6 +4,6 @@ testdata/*.log
 testdata/*.gz
 !testdata/sample*.log
 hem-debug.log
-docs/logs_*.zip
+docs/*.zip
 /demo.log
 docs/demo-local.gif

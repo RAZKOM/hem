@@ -36,6 +36,21 @@ authors.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 keywords = ["log", "tui", "tail", "viewer", "terminal"]
+# Keep the published crate to sources, tests and docs: without a list it
+# shipped docs/demo.gif (7 MB, near crates.io's 10 MB limit) and the CI
+# workflows.  The README's images resolve against the repository.
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/benches/**/*.rs",
+    "/examples/**/*.rs",
+    "/testdata/sample*.log",
+    "/docs/filtering.md",
+    "/README.md",
+    "/DECISIONS.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
 categories = ["command-line-utilities", "development-tools::debugging"]
 default-run = "hem"
 

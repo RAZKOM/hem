@@ -247,6 +247,9 @@ needed. Items marked **review** deserve a look from the owner.
 ## Releases
 
 - Distribution is GitHub Releases (cargo-dist) and crates.io only.
+- The `hem` crate lists what it publishes (`include` in `Cargo.toml`):
+  sources, tests, sample data and docs, but not `docs/demo.gif` (7 MB;
+  crates.io refuses crates over 10 MB) or the CI workflows.
 - crates.io publishing lives in its own workflow (`publish.yml`), not in
   cargo-dist's `release.yml`, so regenerating the dist workflow cannot drop
   it. `dist-workspace.toml` keeps `publish-jobs = []` for the same reason.
