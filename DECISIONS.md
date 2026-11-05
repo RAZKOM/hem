@@ -32,6 +32,15 @@ needed. Items marked **review** deserve a look from the owner.
   file that ends with a newline has one extra sentinel offset; `line_count`
   accounts for it. The vector is shrunk to fit once the initial scan
   completes, so capacity doubling does not inflate memory.
+- **Only finished lines are published.** Consumers (filtered views, the
+  merge, search, plain mode) treat every line they are given as final, so
+  while indexing, a source reports only lines that end with `\n`; scan
+  steps and writers both stop mid-line. An unfinished last line is
+  reported once no more data can come (the input ended, or the file is not
+  followed) or once it has not changed for four polls (~1 s), so a file
+  without a final newline still shows its last line. A writer that pauses
+  mid-line for longer than that and then finishes the line is the one case
+  where a filtered view still sees the first half.
 - **Background jobs stream in order.** `par::ordered_scan` runs chunk work
   on up to 8 threads and emits results strictly in chunk order, so the view
   builder, search and merge can append to their output vectors as prefixes

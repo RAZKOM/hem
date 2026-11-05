@@ -547,3 +547,43 @@ fn follow_keeps_the_old_files_last_lines_on_rotation() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines, ["a1", "a2", "a3", "n1"], "{err}");
 }
+
+#[test]
+fn half_written_lines_are_not_taken_for_whole_ones() {
+    // A writer that is midway through a line when hem reads: the first half
+    // used to be published as a whole line, filtered out (the match is in
+    // the second half) and never looked at again.
+    let mut child = hem()
+        .args(["--filter", "timeout", "--plain"])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().unwrap();
+    for i in 0..3 {
+        stdin
+            .write_all(format!("request {i} failed with a ").as_bytes())
+            .unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        stdin.write_all(b"timeout\n").unwrap();
+        stdin.flush().unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.lines().count(), 3, "{text}");
+}
+
+#[test]
+fn a_last_line_without_newline_is_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("app.log");
+    std::fs::write(&p, "a\nb\nno newline at the end").unwrap();
+    let (code, out, err) = run_with_timeout(&[p.to_str().unwrap()], 20);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "a\nb\nno newline at the end\n");
+    let (out, err) = follow(&[p.to_str().unwrap()], || {});
+    assert_eq!(out, "a\nb\nno newline at the end\n", "{err}");
+}

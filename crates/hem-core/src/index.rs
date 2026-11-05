@@ -44,6 +44,12 @@ impl LineIndex {
         }
     }
 
+    /// Number of lines that end with a `\n` (every line but an unfinished
+    /// last one).
+    pub fn complete_lines(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
     /// Byte range `[start, end)` of line `i`, *including* its line terminator.
     pub fn raw_span(&self, i: usize) -> Option<(u64, u64)> {
         if i >= self.line_count() {

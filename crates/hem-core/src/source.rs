@@ -756,6 +756,9 @@ fn follower_main(
     let mut probe: Option<Vec<u8>> = None;
     // When a rename rotation was seen: switch to the new file at this time.
     let mut rotate_at: Option<Instant> = None;
+    // An unfinished last line (no `\n` yet) and since when it has not
+    // changed: `(indexed bytes, since)`.
+    let mut partial_since: Option<(u64, Instant)> = None;
 
     loop {
         if inner.stop.load(Ordering::Acquire) {
@@ -882,12 +885,17 @@ fn follower_main(
                     (None, _) => break,
                 };
                 {
+                    // Only lines that end with `\n` are published while
+                    // indexing: a scan step usually ends inside a line, and
+                    // consumers (filtered views, the merge, plain mode)
+                    // treat every published line as final.  An unfinished
+                    // last line is published once it is (see below).
                     let mut st = inner.state.write();
                     st.index.append_offsets(&offsets, end as u64);
                     inner
                         .stats
                         .line_count
-                        .store(st.index.line_count(), Ordering::Release);
+                        .store(st.index.complete_lines(), Ordering::Release);
                 }
                 inner
                     .stats
@@ -921,6 +929,37 @@ fn follower_main(
         if !shrunk {
             inner.state.write().index.shrink_to_fit();
             shrunk = true;
+        }
+        // Caught up.  An unfinished last line counts once no more data can
+        // come (the input ended, or the file is not followed), or once it
+        // has stayed the same for a while: a file without a final newline
+        // still shows its last line, and a line whose writer is midway
+        // through it is not taken for a whole one.
+        {
+            let st = inner.state.read();
+            let (all, done) = (st.index.line_count(), st.index.complete_lines());
+            let scanned = st.index.scanned();
+            drop(st);
+            let publish = if all > done {
+                let final_input = (finite && writer_done) || (!opts.follow && !finite);
+                let since = match partial_since {
+                    Some((at, since)) if at == scanned => since,
+                    _ => {
+                        let now = Instant::now();
+                        partial_since = Some((scanned, now));
+                        now
+                    }
+                };
+                if final_input || since.elapsed() >= opts.poll_interval * 4 {
+                    all
+                } else {
+                    done
+                }
+            } else {
+                partial_since = None;
+                all
+            };
+            inner.stats.line_count.store(publish, Ordering::Release);
         }
         inner.stats.complete.store(true, Ordering::Release);
         inner.wake();
