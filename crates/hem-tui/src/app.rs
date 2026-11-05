@@ -629,6 +629,8 @@ pub struct App {
     pub session_name: Option<String>,
     /// When quit was last pressed, with "confirm before quitting" on.
     quit_armed: Option<Instant>,
+    /// A background failure (`hem_core::crash`) was shown.
+    crash_reported: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -713,6 +715,7 @@ impl App {
             modal: None,
             templates_mode: false,
             notices: VecDeque::new(),
+            crash_reported: false,
             quit: false,
             ascii: opts.ascii || defaults.ascii,
             mouse: opts.mouse && defaults.mouse,
@@ -1040,6 +1043,18 @@ impl App {
     // --- Periodic update ---------------------------------------------------
 
     pub fn tick(&mut self) {
+        if !self.crash_reported {
+            if let Some(msg) = hem_core::crash::failure() {
+                self.crash_reported = true;
+                self.log_debug(&format!("background failure: {msg}"));
+                self.notices.push_back(Notice {
+                    text: format!("internal error, results may be incomplete: {msg}"),
+                    until: Instant::now() + Duration::from_secs(60),
+                    warning: true,
+                });
+                self.mark_dirty();
+            }
+        }
         self.tab().view.resume();
         // A search restored from a session starts when its tab is shown.
         if self.tab().search.is_none() && !self.tab().search_text.is_empty() {

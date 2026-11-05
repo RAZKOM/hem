@@ -9,6 +9,7 @@
 
 pub mod cluster;
 pub mod collapse;
+pub mod crash;
 pub mod error;
 pub mod fields;
 pub mod filter;

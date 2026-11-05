@@ -36,7 +36,25 @@ pub fn setup(mouse: bool) -> Result<Term> {
     ACTIVE.store(true, Ordering::SeqCst);
     MOUSE.store(mouse, Ordering::SeqCst);
     let default_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        if thread.id() != ui_thread && ACTIVE.load(Ordering::SeqCst) {
+            // A background job (view builder, search, …) panicked.  It is
+            // caught on its thread and reported in the status bar, so keep
+            // the screen intact instead of restoring the terminal under a
+            // UI that keeps running.  The message is printed after quitting.
+            let msg = hem_core::crash::panic_message(info.payload());
+            let at = info
+                .location()
+                .map(|l| format!(" at {}:{}", l.file(), l.line()))
+                .unwrap_or_default();
+            hem_core::crash::record(format!(
+                "{}: {msg}{at}",
+                thread.name().unwrap_or("background thread")
+            ));
+            return;
+        }
         restore();
         default_hook(info);
     }));

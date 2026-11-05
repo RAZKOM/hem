@@ -381,10 +381,15 @@ impl Clusters {
             cap: cap.max(1000),
         });
         let c = Clusters(inner);
-        let c2 = c.clone();
-        let _ = std::thread::Builder::new()
-            .name("hem-cluster".into())
-            .spawn(move || cluster_main(c2));
+        let (c2, c3) = (c.clone(), c.clone());
+        let _ = crate::crash::spawn(
+            "hem-cluster",
+            move || cluster_main(c2),
+            move || {
+                c3.0.complete.store(true, Ordering::Release);
+                c3.wake();
+            },
+        );
         c
     }
 

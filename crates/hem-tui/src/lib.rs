@@ -73,7 +73,13 @@ pub fn run(opts: RunOptions) -> Result<()> {
         Ok(None) => {}
         Err(e) => eprintln!("hem: could not save the session: {e:#}"),
     }
-    result
+    result?;
+    if let Some(msg) = hem_core::crash::failure() {
+        anyhow::bail!(
+            "internal error in {msg} (please report it at https://github.com/RAZKOM/hem/issues)"
+        );
+    }
+    Ok(())
 }
 
 fn event_loop(term: &mut terminal::Term, app: &mut App) -> Result<()> {

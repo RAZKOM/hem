@@ -63,10 +63,15 @@ impl Merged {
             cancel: AtomicBool::new(false),
             wakers: Mutex::new(Vec::new()),
         });
-        let m2 = Arc::clone(&m);
-        let _ = std::thread::Builder::new()
-            .name("hem-merge".into())
-            .spawn(move || merge_main(m2));
+        let (m2, m3) = (Arc::clone(&m), Arc::clone(&m));
+        let _ = crate::crash::spawn(
+            "hem-merge",
+            move || merge_main(m2),
+            move || {
+                m3.complete.store(true, Ordering::Release);
+                m3.wake();
+            },
+        );
         m
     }
 

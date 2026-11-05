@@ -314,9 +314,10 @@ impl Source {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let writer_path = temp_path.clone();
         let src2 = src.clone();
-        std::thread::Builder::new()
-            .name("hem-gunzip".into())
-            .spawn(move || {
+        let failed = src.clone();
+        crate::crash::spawn(
+            "hem-gunzip",
+            move || {
                 let res = (|| -> std::io::Result<()> {
                     let mut out = std::fs::OpenOptions::new()
                         .append(true)
@@ -340,8 +341,12 @@ impl Source {
                 }
                 src2.0.poke();
                 let _ = done_tx.send(());
-            })
-            .map_err(Error::Io)?;
+            },
+            // `done_tx` is dropped while unwinding, which the follower
+            // treats as the end of the input.
+            move || failed.0.poke(),
+        )
+        .map_err(Error::Io)?;
         src.spawn_follower(temp_path, opts, Some(done_rx));
         Ok(src)
     }
@@ -364,9 +369,10 @@ impl Source {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let writer_path = temp_path.clone();
         let src2 = src.clone();
-        std::thread::Builder::new()
-            .name("hem-stdin".into())
-            .spawn(move || {
+        let failed = src.clone();
+        crate::crash::spawn(
+            "hem-stdin",
+            move || {
                 let res = (|| -> std::io::Result<()> {
                     let mut out = std::fs::OpenOptions::new()
                         .append(true)
@@ -393,8 +399,12 @@ impl Source {
                 }
                 src2.0.poke();
                 let _ = done_tx.send(());
-            })
-            .map_err(Error::Io)?;
+            },
+            // `done_tx` is dropped while unwinding, which the follower
+            // treats as the end of the input.
+            move || failed.0.poke(),
+        )
+        .map_err(Error::Io)?;
         src.spawn_follower(temp_path, opts, Some(done_rx));
         Ok(src)
     }
@@ -568,9 +578,15 @@ impl Source {
         let (tx, rx) = mpsc::channel::<()>();
         *self.0.poke.lock() = Some(tx.clone());
         let inner = Arc::clone(&self.0);
-        let _ = std::thread::Builder::new()
-            .name(format!("hem-index-{}", inner.name))
-            .spawn(move || follower_main(inner, path, opts, tx, rx, eof_rx));
+        let failed = Arc::clone(&self.0);
+        let _ = crate::crash::spawn(
+            &format!("hem-index-{}", inner.name),
+            move || follower_main(inner, path, opts, tx, rx, eof_rx),
+            move || {
+                failed.stats.complete.store(true, Ordering::Release);
+                failed.push_notice(Notice::Error("indexing stopped: internal error".into()));
+            },
+        );
     }
 }
 
@@ -725,7 +741,12 @@ fn follower_main(
             break;
         }
         if let Some(rx) = &eof_rx {
-            if !writer_done && rx.try_recv().is_ok() {
+            if !writer_done
+                && matches!(
+                    rx.try_recv(),
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+                )
+            {
                 writer_done = true;
             }
         }

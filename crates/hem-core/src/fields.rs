@@ -349,7 +349,14 @@ pub fn syslog_fields(line: &[u8]) -> Vec<Field> {
     }
     // Timestamp: "Mon DD HH:MM:SS" = 15 chars, or an ISO timestamp word.
     let t = rest.trim_start();
-    let ts_len = if t.len() >= 15 && t.as_bytes()[3] == b' ' && t.as_bytes()[9] == b':' {
+    // `is_char_boundary` matters: bytes 3 and 9 can be a space and a colon in
+    // ordinary text ("Got error: café…"), and slicing inside a multi-byte
+    // character panics.
+    let ts_len = if t.len() >= 15
+        && t.as_bytes()[3] == b' '
+        && t.as_bytes()[9] == b':'
+        && t.is_char_boundary(15)
+    {
         15
     } else {
         t.find(' ').unwrap_or(t.len())
@@ -428,6 +435,15 @@ mod tests {
         assert_eq!(get("app"), Some("sshd"));
         assert_eq!(get("pid"), Some("1234"));
         assert_eq!(get("msg"), Some("Accepted publickey for bob"));
+    }
+
+    #[test]
+    fn syslog_never_slices_inside_a_character() {
+        // Bytes 3 and 9 are ' ' and ':', and byte 15 is inside 'é'.
+        for line in ["Got error: café au lait", "Oct 13 10:0000é host app: msg"] {
+            let _ = syslog_fields(line.as_bytes());
+            let _ = get(line.as_bytes(), Format::Syslog, "host");
+        }
     }
 
     #[test]

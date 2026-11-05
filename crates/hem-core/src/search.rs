@@ -56,10 +56,15 @@ impl Search {
             wakers: Mutex::new(Vec::new()),
         });
         let s = Search(inner);
-        let s2 = s.clone();
-        let _ = std::thread::Builder::new()
-            .name("hem-search".into())
-            .spawn(move || search_main(s2));
+        let (s2, s3) = (s.clone(), s.clone());
+        let _ = crate::crash::spawn(
+            "hem-search",
+            move || search_main(s2),
+            move || {
+                s3.0.complete.store(true, Ordering::Release);
+                s3.wake();
+            },
+        );
         s
     }
 

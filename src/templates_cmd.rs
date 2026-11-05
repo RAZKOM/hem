@@ -72,6 +72,9 @@ pub fn run(args: TemplatesArgs, _config: Option<&Path>) -> Result<ExitCode> {
     if !cluster::wait_complete(&clusters, Duration::from_secs(3600)) {
         return Err(anyhow!("clustering timed out"));
     }
+    if let Some(msg) = hem_core::crash::failure() {
+        return Err(anyhow!("internal error in {msg}"));
+    }
     let mut templates: Vec<_> = clusters.templates().iter().cloned().collect();
     templates.sort_by(|a, b| {
         if args.rare {

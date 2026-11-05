@@ -3,7 +3,9 @@
 //! chunks is complete.  This gives background jobs streaming, in-order
 //! output with multi-core throughput.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -24,6 +26,10 @@ struct Emitter<T> {
 /// Run `work(i)` for every `i in 0..n` across `threads` workers and call
 /// `emit(i, result)` strictly in ascending `i` order.  Returns early if
 /// `cancel` is set or `emit` returns `false`.
+///
+/// If `work` or `emit` panics, the other workers stop and the panic is
+/// re-raised on the calling thread once they have.  (Without this, the
+/// others waited forever for the panicked chunk.)
 pub fn ordered_scan<T, W, E>(n: usize, threads: usize, cancel: &AtomicBool, work: W, emit: E)
 where
     T: Send,
@@ -41,12 +47,13 @@ where
         next: 0,
     });
     let emit = Mutex::new(emit);
+    let panicked: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
     // Limit how far ahead workers may run so memory stays bounded.
     let window = threads * 2;
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| loop {
+            let worker = || loop {
                 if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                     return;
                 }
@@ -83,9 +90,19 @@ where
                         return;
                     }
                 }
+            };
+            let (stop, panicked) = (&stop, &panicked);
+            scope.spawn(move || {
+                if let Err(p) = catch_unwind(AssertUnwindSafe(worker)) {
+                    stop.store(true, Ordering::Relaxed);
+                    panicked.lock().get_or_insert(p);
+                }
             });
         }
     });
+    if let Some(p) = panicked.into_inner() {
+        resume_unwind(p);
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +134,27 @@ mod tests {
             assert_eq!(*i, k);
             assert_eq!(*r, k * 2);
         }
+    }
+
+    #[test]
+    fn a_panicking_chunk_does_not_hang_the_scan() {
+        let cancel = AtomicBool::new(false);
+        let r = std::panic::catch_unwind(|| {
+            ordered_scan(
+                200,
+                4,
+                &cancel,
+                |i| {
+                    if i == 3 {
+                        panic!("chunk 3 failed");
+                    }
+                    i
+                },
+                |_, _| true,
+            )
+        });
+        let msg = crate::crash::panic_message(&*r.unwrap_err());
+        assert_eq!(msg, "chunk 3 failed");
     }
 
     #[test]

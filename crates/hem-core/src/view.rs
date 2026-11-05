@@ -483,10 +483,15 @@ impl View {
         // The base has probably been indexed meanwhile: size the timeline
         // from what is known now.
         *self.0.hist.write() = initial_histogram(&self.0.base, self.0.default_year);
-        let v = self.clone();
-        let _ = std::thread::Builder::new()
-            .name("hem-view".into())
-            .spawn(move || builder_main(v));
+        let (v, v2) = (self.clone(), self.clone());
+        let _ = crate::crash::spawn(
+            "hem-view",
+            move || builder_main(v),
+            move || {
+                v2.0.complete.store(true, Ordering::Release);
+                v2.wake();
+            },
+        );
     }
 
     /// Has building started?
