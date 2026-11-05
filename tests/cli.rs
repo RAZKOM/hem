@@ -380,3 +380,170 @@ fn sessions_list_resume_and_reopen_files_in_plain_mode() {
     assert!(out.contains("deleted"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Run hem until it exits, failing (instead of hanging the test run) if it
+/// takes longer than `secs`.
+fn run_with_timeout(args: &[&str], secs: u64) -> (i32, String, String) {
+    let mut child = hem()
+        .args(args)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("hem {args:?} did not exit within {secs}s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Start `hem ARGS -f --plain`, let it settle, run `act`, then stop it and
+/// return what it printed.
+fn follow(args: &[&str], act: impl FnOnce()) -> (String, String) {
+    let mut child = hem()
+        .args(args)
+        .args(["-f", "--plain"])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    act();
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn multibyte_text_in_a_syslog_source_does_not_crash() {
+    // Bytes 3 and 9 of the last line are ' ' and ':' and byte 15 is inside
+    // 'é': the syslog field parser used to slice there, panic on the view
+    // thread and leave plain mode waiting forever.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("sys.log");
+    let mut text = String::new();
+    for i in 1..=3 {
+        text.push_str(&format!("Oct 13 10:02:1{i} web01 sshd[1234]: ok {i}\n"));
+    }
+    text.push_str("Oct 13 10:0000é host app: msg\n");
+    std::fs::write(&p, text).unwrap();
+    let (code, out, err) = run_with_timeout(&[p.to_str().unwrap(), "--field", "app=sshd"], 20);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.lines().count(), 3, "{out}");
+}
+
+#[test]
+fn collapsed_counts_are_final_in_plain_mode() {
+    // Runs longer than a view chunk (32 768 rows) used to be printed before
+    // the next chunk added to their count.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("runs.log");
+    let mut text = String::new();
+    for word in ["alpha", "beta", "gamma"] {
+        for i in 0..40_000 {
+            text.push_str(&format!("{word} request {i} handled\n"));
+        }
+    }
+    std::fs::write(&p, text).unwrap();
+    let (code, out, err) = run_with_timeout(&[p.to_str().unwrap(), "--collapse"], 60);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "×40000 alpha request 0 handled",
+            "×40000 beta request 0 handled",
+            "×40000 gamma request 0 handled"
+        ]
+    );
+}
+
+#[test]
+fn corrupt_gzip_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("bad.log.gz");
+    std::fs::write(&p, b"this is not gzip").unwrap();
+    let (code, _, err) = run_with_timeout(&[p.to_str().unwrap()], 20);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("gunzip"), "{err}");
+}
+
+#[test]
+fn follow_prints_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.log");
+    let b = dir.path().join("b.log");
+    std::fs::write(&a, "a one\n").unwrap();
+    std::fs::write(&b, "b one\n").unwrap();
+    let (out, err) = follow(&[a.to_str().unwrap(), b.to_str().unwrap()], || {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&b).unwrap();
+        f.write_all(b"b two\n").unwrap();
+    });
+    assert!(out.contains("==> a.log <==\na one\n"), "{out}\n{err}");
+    assert!(
+        out.contains("==> b.log <==\nb one\nb two\n"),
+        "{out}\n{err}"
+    );
+}
+
+#[test]
+fn follow_after_truncation_prints_the_new_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("app.log");
+    std::fs::write(&p, "a1\na2\na3\na4\na5\n").unwrap();
+    // Truncated and refilled past its old length before hem's next poll.
+    let (out, err) = follow(&[p.to_str().unwrap()], || {
+        std::fs::write(&p, "b1\nb2\nb3\nb4\nb5\nb6\nb7\n").unwrap();
+    });
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines,
+        ["a1", "a2", "a3", "a4", "a5", "b1", "b2", "b3", "b4", "b5", "b6", "b7"],
+        "{err}"
+    );
+    assert!(err.contains("truncated"), "{err}");
+}
+
+#[test]
+fn follow_counts_repeats_that_arrive_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("app.log");
+    std::fs::write(&p, "same 1\n").unwrap();
+    let (out, err) = follow(&[p.to_str().unwrap(), "--collapse"], || {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"same 2\nsame 3\nother\n").unwrap();
+    });
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines, ["same 1", "×2 same 1", "other"], "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn follow_keeps_the_old_files_last_lines_on_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("app.log");
+    std::fs::write(&p, "a1\na2\n").unwrap();
+    let (out, err) = follow(&[p.to_str().unwrap()], || {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"a3\n").unwrap();
+        std::fs::rename(&p, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&p, "n1\n").unwrap();
+    });
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines, ["a1", "a2", "a3", "n1"], "{err}");
+}

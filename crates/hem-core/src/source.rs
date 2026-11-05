@@ -702,6 +702,22 @@ fn start_watcher(path: &Path, tx: Sender<()>) -> Option<notify::RecommendedWatch
     Some(watcher)
 }
 
+/// The first and last 64 bytes of `[0, scanned)`: bytes that stay the same
+/// while a file only grows.  A writer that truncates a file and writes more
+/// than it held before, all between two polls, leaves it longer than the
+/// index, so the length alone looks like ordinary growth.
+fn growth_probe(file: &File, scanned: u64) -> Vec<u8> {
+    const N: u64 = 64;
+    let head = scanned.min(N);
+    let tail_start = scanned.saturating_sub(N).max(head);
+    let mut buf = vec![0u8; (head + (scanned - tail_start)) as usize];
+    let (h, t) = buf.split_at_mut(head as usize);
+    let got_h = crate::paged::read_full_at(file, h, 0).unwrap_or(0);
+    let got_t = crate::paged::read_full_at(file, t, tail_start).unwrap_or(0);
+    buf.truncate(got_h + got_t);
+    buf
+}
+
 /// The follower / indexer thread.
 fn follower_main(
     inner: Arc<Inner>,
@@ -735,6 +751,11 @@ fn follower_main(
     let mut last_progress = Instant::now();
     let finite = eof_rx.is_some();
     let mut writer_done = false;
+    // Bytes of an indexed file that cannot change while it only grows
+    // (see `growth_probe`).
+    let mut probe: Option<Vec<u8>> = None;
+    // When a rename rotation was seen: switch to the new file at this time.
+    let mut rotate_at: Option<Instant> = None;
 
     loop {
         if inner.stop.load(Ordering::Acquire) {
@@ -756,13 +777,24 @@ fn follower_main(
             match identity_of_path(&path) {
                 Some(now) => {
                     if identity.as_ref() != Some(&now) {
-                        if let Ok(nf) = File::open(&path) {
-                            file = Arc::new(nf);
-                            identity = Some(now);
-                            data_len = 0;
-                            paged = None;
-                            inner.reset(Notice::Rotated);
-                            continue;
+                        // Lines written to the old file before it was renamed
+                        // away come first, as with `tail -F`: keep indexing it
+                        // for one more poll, so they reach the views (which
+                        // may still be behind on lines indexed just before
+                        // the rename), then switch to the new file.
+                        let due =
+                            *rotate_at.get_or_insert_with(|| Instant::now() + opts.poll_interval);
+                        if Instant::now() >= due {
+                            if let Ok(nf) = File::open(&path) {
+                                file = Arc::new(nf);
+                                identity = Some(now);
+                                data_len = 0;
+                                paged = None;
+                                probe = None;
+                                rotate_at = None;
+                                inner.reset(Notice::Rotated);
+                                continue;
+                            }
                         }
                     }
                     missing_reported = false;
@@ -787,9 +819,17 @@ fn follower_main(
         inner.stats.total_bytes.store(len, Ordering::Release);
         let scanned = inner.state.read().index.scanned();
 
-        if len < scanned {
+        // Truncated, or truncated and written past the old length within
+        // one poll (only the probe can tell that from plain growth).
+        let rewritten = len > scanned
+            && inner.kind == SourceKind::File
+            && probe
+                .as_ref()
+                .is_some_and(|p| *p != growth_probe(&file, scanned));
+        if len < scanned || rewritten {
             data_len = 0;
             paged = None;
+            probe = None;
             inner.reset(Notice::Truncated);
             continue;
         }
@@ -861,6 +901,9 @@ fn follower_main(
             }
             if scan_buf.capacity() > SCAN_CHUNK {
                 scan_buf = Vec::new();
+            }
+            if inner.kind == SourceKind::File {
+                probe = Some(growth_probe(&file, inner.state.read().index.scanned()));
             }
             inner.wake();
             continue;

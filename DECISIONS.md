@@ -215,7 +215,14 @@ needed. Items marked **review** deserve a look from the owner.
 - Plain mode never collapses unless `--collapse` is passed, so
   `hem app.log --level error --plain | wc -l` counts lines.
 - Collapsed rows in plain mode print a `×N` prefix; merged streams print a
-  padded source name column.
+  padded source name column. A row is printed once its count is final:
+  the last row waits until the view has caught up, and repeats that arrive
+  later in follow mode are printed as a row of their own (`×2 line`).
+- `-f --plain` with several files and no `--merge` prints each file, then
+  follows all of them, with `tail`-style `==> name <==` headers. A
+  truncation or rotation starts the output again from the new content and
+  is reported on stderr; a source read error (a corrupt `.gz`) is reported
+  on stderr and makes hem exit 1.
 - `--format` accepts the built-in names and any `[formats.<name>]` from the
   config.
 - `hem templates` prints a table (or `--json` lines) and uses the same
@@ -250,7 +257,12 @@ needed. Items marked **review** deserve a look from the owner.
   truncate-then-append and delete on Windows. Reads past a new, shorter end
   come back zero-filled until the follower's next poll (≤ 250 ms) notices
   and re-indexes. Rotation by rename is detected via file identity
-  (`same-file`: volume + file index on Windows, dev + inode on Unix).
+  (`same-file`: volume + file index on Windows, dev + inode on Unix); hem
+  keeps reading the old file for one more poll before switching, so lines
+  written just before the rename are not lost. A file truncated and
+  refilled past its old length between two polls looks like growth, so the
+  follower also compares the first and last 64 indexed bytes before
+  reading on.
 - **With `--mmap` the old limits return:** Windows refuses to truncate a
   file while hem maps it ("user-mapped section open"), and on Unix a
   truncation can fault the mapping (SIGBUS) before the next poll.
