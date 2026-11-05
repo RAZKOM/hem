@@ -72,10 +72,13 @@ needed. Items marked **review** deserve a look from the owner.
   severities (0–7) are understood in `level` fields.
 - **Format detection needs a clear majority** (> 50 % of a 200-line sample)
   so a few JSON lines inside a plain log do not flip the whole source.
-- **Repeat normalisation** masks hex/decimal runs that contain a digit,
-  quoted strings and whitespace runs (`collapse::normalize`). Words made of
-  hex letters only (`dead`, `cafe`) are kept. The 64-bit FNV hash of the
-  normalised form is compared, never stored per line.
+- **Repeat normalisation** masks hex/decimal runs that contain a digit and
+  whitespace runs (`collapse::shape_hash`). Words made of hex letters only
+  (`dead`, `cafe`) are kept. The 64-bit FNV hash of the normalised form is
+  compared, never stored per line. Words inside quotes are kept too: in
+  JSON and logfmt every value is quoted, and masking them folded a
+  `"level":"fatal"` line into the run of `"level":"info"` lines around it.
+  Template mining (`collapse::normalize`) still masks quoted strings.
 - **Template mining is Drain with a few tweaks.**
   - Lines are routed on the first four *non-wildcard* tokens (timestamps at
     the start of a line would otherwise be useless keys), so different

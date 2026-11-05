@@ -4,8 +4,15 @@
 //! Normalisation replaces:
 //! * runs of hex digits that contain at least one decimal digit (numbers,
 //!   hex ids, UUID segments, IP octets, timestamps) with `#`;
-//! * double- or single-quoted strings with `"#"`;
-//! * runs of whitespace with a single space.
+//! * double- or single-quoted strings with `"#"` (template mining only, see
+//!   below);
+//! * runs of whitespace with a single space, dropping leading and trailing
+//!   whitespace.
+//!
+//! Repeat collapsing ([`shape_hash`]) keeps the words inside quotes. In
+//! JSON and logfmt every value is quoted, so masking them made every line
+//! with the same keys "the same", and a `"level":"fatal"` line folded into
+//! the `"level":"info"` run around it.
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -15,11 +22,26 @@ fn is_hexish(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
-/// Feed the normalised form of `line` into `sink` byte by byte.
-fn normalize_into(line: &[u8], mut sink: impl FnMut(u8)) {
+/// Feed the normalised form of `line` into `sink` byte by byte.  With
+/// `mask_quotes`, quoted strings become `"#"`; without, their contents are
+/// normalised like the rest of the line.
+fn normalize_into(line: &[u8], mask_quotes: bool, mut sink: impl FnMut(u8)) {
     let n = line.len();
     let mut i = 0;
-    let mut last_space = true;
+    // Whitespace is emitted lazily, as one space before the next non-space
+    // byte, so leading and trailing whitespace never reach the sink.
+    let mut started = false;
+    let mut pending_space = false;
+    macro_rules! sink {
+        ($b:expr) => {{
+            if pending_space && started {
+                sink(b' ');
+            }
+            pending_space = false;
+            started = true;
+            sink($b);
+        }};
+    }
     while i < n {
         let b = line[i];
         if is_hexish(b) {
@@ -40,19 +62,17 @@ fn normalize_into(line: &[u8], mut sink: impl FnMut(u8)) {
             let word_boundary_before = i == 0 || !line[i - 1].is_ascii_alphanumeric();
             let word_boundary_after = j >= n || !line[j].is_ascii_alphanumeric();
             if has_digit && (word_boundary_before || word_boundary_after || j - i >= 4) {
-                sink(b'#');
+                sink!(b'#');
                 i = j;
-                last_space = false;
                 continue;
             }
             for &c in &line[i..j] {
-                sink(c);
+                sink!(c);
             }
             i = j;
-            last_space = false;
             continue;
         }
-        if b == b'"' || b == b'\'' {
+        if mask_quotes && (b == b'"' || b == b'\'') {
             // Quoted string: find the closing quote on this line.
             let q = b;
             let mut j = i + 1;
@@ -69,46 +89,47 @@ fn normalize_into(line: &[u8], mut sink: impl FnMut(u8)) {
                 j += 1;
             }
             if closed && j - i <= 512 {
-                sink(q);
-                sink(b'#');
-                sink(q);
+                sink!(q);
+                sink!(b'#');
+                sink!(q);
                 i = j + 1;
-                last_space = false;
                 continue;
             }
-            sink(b);
+            sink!(b);
             i += 1;
-            last_space = false;
             continue;
         }
         if b.is_ascii_whitespace() {
-            if !last_space {
-                sink(b' ');
-            }
-            last_space = true;
+            pending_space = true;
             i += 1;
             continue;
         }
-        sink(b);
-        last_space = false;
+        sink!(b);
         i += 1;
     }
 }
 
-/// The normalised form of a line, as bytes.
+/// The normalised form of a line, as bytes, with quoted strings masked
+/// (used by template mining).
 pub fn normalize(line: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(line.len());
-    normalize_into(line, |b| out.push(b));
-    while out.last() == Some(&b' ') {
-        out.pop();
-    }
+    normalize_into(line, true, |b| out.push(b));
     out
 }
 
-/// 64-bit hash of the normalised form, without allocating.
+/// The form [`shape_hash`] hashes: like [`normalize`], but quoted strings
+/// keep their words.
+pub fn repeat_shape(line: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len());
+    normalize_into(line, false, |b| out.push(b));
+    out
+}
+
+/// 64-bit hash of a line's repeat shape ([`repeat_shape`]), without
+/// allocating.  Lines with the same hash collapse into one row.
 pub fn shape_hash(line: &[u8]) -> u64 {
     let mut h = FNV_OFFSET;
-    normalize_into(line, |b| {
+    normalize_into(line, false, |b| {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
     });
@@ -166,6 +187,29 @@ mod tests {
         let b = b"connection reset by peer (attempt 17)";
         assert!(same_shape(a, b));
         assert!(!same_shape(a, b"connection closed by peer (attempt 4)"));
-        assert_eq!(shape_hash(a), shape_hash(&normalize(a)));
+        assert_eq!(shape_hash(a), shape_hash(&repeat_shape(a)));
+        // Trailing whitespace does not change the shape.
+        assert!(same_shape(b"disk full", b"disk full  "));
+    }
+
+    #[test]
+    fn structured_lines_keep_their_values() {
+        // Every JSON value is quoted: masking them made all of these one run.
+        let info = br#"{"level":"info","msg":"server started"}"#;
+        let fatal = br#"{"level":"fatal","msg":"out of memory"}"#;
+        let bye = br#"{"level":"info","msg":"bye"}"#;
+        assert!(!same_shape(info, fatal));
+        assert!(!same_shape(info, bye));
+        // Numbers and ids inside quotes still vary freely.
+        assert!(same_shape(
+            br#"{"level":"info","msg":"retry 3","req":"a1b2c3d4"}"#,
+            br#"{"level":"info","msg":"retry 17","req":"ffee0912"}"#,
+        ));
+        assert!(!same_shape(
+            br#"level=info msg="cache warm""#,
+            br#"level=error msg="cache cold""#,
+        ));
+        // Template mining still masks quoted strings.
+        assert_eq!(n(r#"user "bob" in"#), r##"user "#" in"##);
     }
 }
