@@ -166,22 +166,30 @@ fn scan_chunk(s: &Inner, a: usize, b: usize) -> Vec<u64> {
         let Some(hay) = data.get(start..end) else {
             return out;
         };
-        let mut last_line: Option<usize> = None;
-        for m in re.find_iter(hay) {
-            let abs = (start + m.start()) as u64;
+        // Find the next match, credit it to the line it starts in, and go
+        // on from the next line (one hit per line is all we need).  A match
+        // that is not inside one line's text (it runs into the next line,
+        // or is an empty match at a line end) is settled by matching that
+        // line on its own.
+        let mut pos = 0;
+        while pos <= hay.len() {
+            let Some(m) = re.find_at(hay, pos) else {
+                break;
+            };
+            let (ms, me) = ((start + m.start()) as u64, (start + m.end()) as u64);
             let i = chunk
                 .spans
-                .partition_point(|(s, _)| *s <= abs)
+                .partition_point(|(s, _)| *s <= ms)
                 .saturating_sub(1);
-            // The match must start inside the line (not in its terminator).
             let (ls, ll) = chunk.spans[i];
-            if abs >= ls + ll as u64 {
-                continue;
-            }
-            if last_line != Some(i) {
+            let text_end = ls + ll as u64;
+            if (ms < text_end && me <= text_end) || re.is_match(chunk.line(i)) {
                 out.push((a + i) as u64);
-                last_line = Some(i);
             }
+            if i + 1 >= chunk.len() {
+                break;
+            }
+            pos = (chunk.spans[i + 1].0 - start as u64) as usize;
         }
     } else {
         for i in 0..chunk.len() {
@@ -339,5 +347,38 @@ mod tests {
         let s = Search::start(v, Matcher::new("xx", false).unwrap());
         assert!(wait_complete(&s, Duration::from_secs(5)));
         assert_eq!(s.matches(), vec![0, 2]);
+    }
+
+    fn rows_matching(text: &str, pattern: &str) -> Vec<u64> {
+        let v = view(text, ViewSpec::default());
+        let s = Search::start(v, Matcher::new(pattern, false).unwrap());
+        assert!(wait_complete(&s, Duration::from_secs(5)));
+        s.matches()
+    }
+
+    #[test]
+    fn anchors_match_on_every_line() {
+        // The fast path runs one regex over a whole chunk of lines: `^` and
+        // `$` used to match only at its start and end.
+        let text = "ERROR a\nERROR b\nok ERROR\nERROR c\n";
+        assert_eq!(rows_matching(text, "^ERROR"), vec![0, 1, 3]);
+        assert_eq!(rows_matching(text, "ERROR$"), vec![2]);
+        assert_eq!(rows_matching("a\n\nb\n\n", "^$"), vec![1, 3]);
+        assert_eq!(rows_matching("x\r\ny\r\n", "^y$"), vec![1]);
+        let mut big = String::new();
+        for i in 0..100_000 {
+            big.push_str(if i % 3 == 0 { "ERROR x\n" } else { "info x\n" });
+        }
+        assert_eq!(rows_matching(&big, "^ERROR").len(), 33_334);
+    }
+
+    #[test]
+    fn matches_do_not_span_lines() {
+        // `\s` matches a newline: "foo\nbar" is not a match of either line.
+        assert_eq!(rows_matching("foo\nbar\nfoo bar\n", r"foo\sbar"), vec![2]);
+        // A match that runs into the next line must not hide a real match
+        // later on the same line, or on the next one.
+        // ("b\na" spans lines 0 and 1; "b a" is the real match on line 1.)
+        assert_eq!(rows_matching("xb\na yb a\n", r"b\s+a"), vec![1]);
     }
 }

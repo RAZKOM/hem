@@ -157,16 +157,51 @@ fn search_prompt_and_matches() {
         Duration::from_secs(5)
     ));
     assert_eq!(search.count(), 3);
-    key(&mut app, 'n');
+    // Submitting jumps to the first match (once the search has found it).
+    app.tick();
     assert_eq!(app.tab().cursor, 2);
     key(&mut app, 'n');
     assert_eq!(app.tab().cursor, 3);
+    key(&mut app, 'n');
+    assert_eq!(app.tab().cursor, 4);
     key(&mut app, 'N');
-    assert_eq!(app.tab().cursor, 2);
+    assert_eq!(app.tab().cursor, 3);
     let lines = render(&mut app, 100, 20);
     let body = joined(&lines);
     assert!(body.contains("/reset"), "chip missing: {body}");
     assert!(body.contains("3 matches"), "{body}");
+}
+
+#[test]
+fn submitting_a_search_jumps_to_the_first_match() {
+    // The jump used to be tried before the background search had any
+    // results, so it always said "no matches" and stayed put.
+    let mut app = app_with(SAMPLE, false);
+    type_text(&mut app, "/reset");
+    key_code(&mut app, KeyCode::Enter);
+    let search = app.tab().search.clone().expect("search started");
+    assert!(hem_core::search::wait_complete(
+        &search,
+        Duration::from_secs(5)
+    ));
+    app.tick();
+    assert_eq!(app.tab().cursor, 2, "first match after the cursor");
+    let lines = render(&mut app, 100, 20);
+    assert!(joined(&lines).contains("match 1/3"), "{}", joined(&lines));
+
+    // Any other key in the meantime cancels the jump.
+    let mut app = app_with(SAMPLE, false);
+    type_text(&mut app, "/reset");
+    key_code(&mut app, KeyCode::Enter);
+    key(&mut app, 'G');
+    let search = app.tab().search.clone().expect("search started");
+    assert!(hem_core::search::wait_complete(
+        &search,
+        Duration::from_secs(5)
+    ));
+    let bottom = app.tab().cursor;
+    app.tick();
+    assert_eq!(app.tab().cursor, bottom);
 }
 
 #[test]

@@ -34,7 +34,12 @@ impl Matcher {
         } else {
             body
         };
+        // Multi-line mode: `^` and `$` match at every line start / end.  A
+        // line on its own behaves the same either way, but search scans a
+        // whole chunk of lines at once (see `search::scan_chunk`).
         let regex = regex::bytes::RegexBuilder::new(&pattern)
+            .multi_line(true)
+            .crlf(true)
             .size_limit(16 * 1024 * 1024)
             .dfa_size_limit(8 * 1024 * 1024)
             .build()

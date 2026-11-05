@@ -102,6 +102,9 @@ pub struct Tab {
     pub search: Option<Search>,
     pub search_text: String,
     pub current_match: Option<usize>,
+    /// Jump to the first match after the cursor once the search has found
+    /// it (set when a search is submitted, cleared by any other input).
+    pub search_jump: bool,
     /// Pinned lines as `(source, line)`, in the order they were pinned.
     pub pins: Vec<(SourceId, u64)>,
     /// Where each pin sits in the current view (parallel to `pins`).
@@ -219,6 +222,7 @@ impl Tab {
             search: None,
             search_text: String::new(),
             current_match: None,
+            search_jump: false,
             pins: Vec::new(),
             pin_pos: Vec::new(),
             pin_scan: 0,
@@ -1043,6 +1047,7 @@ impl App {
     // --- Periodic update ---------------------------------------------------
 
     pub fn tick(&mut self) {
+        self.resolve_search_jump();
         if !self.crash_reported {
             if let Some(msg) = hem_core::crash::failure() {
                 self.crash_reported = true;
@@ -1310,6 +1315,7 @@ impl App {
             s.cancel();
         }
         t.current_match = None;
+        t.search_jump = false;
         if pattern.is_empty() {
             t.search_text.clear();
             return;
@@ -1640,6 +1646,27 @@ impl App {
                     s.poke();
                 }
             }
+        }
+    }
+
+    /// Make a pending "jump to the first match" happen once it can be
+    /// decided: matches arrive in row order, so the first one after the
+    /// cursor is final as soon as any match after the cursor is known; with
+    /// none, wait until the search has finished (and then wrap around).
+    fn resolve_search_jump(&mut self) {
+        let t = self.tab();
+        if !t.search_jump {
+            return;
+        }
+        let Some(s) = &t.search else {
+            self.tab_mut().search_jump = false;
+            return;
+        };
+        let cur = t.cursor;
+        let ready = s.is_complete() || s.next_after(cur).is_some_and(|(_, row)| row > cur);
+        if ready {
+            self.tab_mut().search_jump = false;
+            self.jump_match(true);
         }
     }
 
@@ -2142,6 +2169,9 @@ impl App {
 
     pub fn handle_key(&mut self, ev: KeyEvent) {
         self.mark_dirty();
+        // Anything typed after submitting a search overrides its pending
+        // jump (submitting a new one sets it again).
+        self.tab_mut().search_jump = false;
         if self.modal.is_some() {
             self.modal_key(ev);
             return;
@@ -2566,9 +2596,11 @@ impl App {
         match kind {
             PromptKind::Search => {
                 self.start_search(text);
-                if !text.is_empty() {
-                    // Jump to the first match once results arrive: try now.
-                    self.jump_match(true);
+                if self.tab().search.is_some() {
+                    // The search runs in the background: jump to the first
+                    // match as soon as it is known (see `tick`).
+                    self.tab_mut().search_jump = true;
+                    self.resolve_search_jump();
                 }
             }
             PromptKind::Include | PromptKind::Exclude => {
@@ -2667,6 +2699,9 @@ impl App {
             return;
         }
         self.mark_dirty();
+        if !matches!(ev.kind, MouseEventKind::Moved) {
+            self.tab_mut().search_jump = false;
+        }
         let (x, y) = (ev.column, ev.row);
         match ev.kind {
             MouseEventKind::ScrollDown => {
