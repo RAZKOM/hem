@@ -30,7 +30,11 @@ use crate::timestamp;
 /// Rows processed per work unit.
 pub const CHUNK_ROWS: usize = 32 * 1024;
 /// How far back to look for an inheritable level / timestamp.
-const CARRY_LOOKBACK: usize = 64;
+/// How far back (in base rows) a chunk looks for the level / timestamp a
+/// line without its own inherits: a short look first, then a longer one.
+/// When neither finds it, the builder still knows the right value from the
+/// chunks before (see [`Carry`]) and redoes the chunk with it.
+const CARRY_LOOKBACK: [usize; 2] = [64, 4096];
 const MAX_COUNT: u32 = 0xFFFF;
 
 /// Index of a source within a [`Base`] (always 0 for a single source).
@@ -751,15 +755,150 @@ struct ChunkOut {
     ts_min: Option<i64>,
     ts_max: Option<i64>,
     saw_ts: bool,
+    /// What the chunk assumed its lines inherit from before it (only for
+    /// values that change the result), to be checked against [`Carry`].
+    assumed: Vec<Assumed>,
+    /// Per source in the chunk: its last own level and timestamp.
+    last_own: Vec<(SourceId, Option<Level>, Option<i64>)>,
+}
+
+/// The level and timestamp a source's lines inherit at some point: those
+/// of its last line that had one.  Tracked per source, so that in a merged
+/// view a stack frame from one file never takes the level of another
+/// file's line just above it.
+#[derive(Debug, Clone, Default)]
+struct Carry(Vec<(Option<Level>, Option<i64>)>);
+
+impl Carry {
+    fn get(&self, source: SourceId) -> (Option<Level>, Option<i64>) {
+        self.0.get(source as usize).copied().unwrap_or_default()
+    }
+
+    /// Does the chunk's assumption about what came before hold?
+    fn agrees(&self, assumed: &[Assumed]) -> bool {
+        assumed.iter().all(|a| {
+            let (level, ts) = self.get(a.source);
+            a.level.is_none_or(|l| l == level) && a.ts.is_none_or(|t| t == ts)
+        })
+    }
+
+    fn advance(&mut self, last_own: &[(SourceId, Option<Level>, Option<i64>)]) {
+        for &(source, level, ts) in last_own {
+            let i = source as usize;
+            if self.0.len() <= i {
+                self.0.resize(i + 1, (None, None));
+            }
+            if level.is_some() {
+                self.0[i].0 = level;
+            }
+            if ts.is_some() {
+                self.0[i].1 = ts;
+            }
+        }
+    }
+}
+
+/// One source's lines within a chunk (see `process_chunk`).
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceState {
+    /// A line of this source was seen in the chunk.
+    seen: bool,
+    /// What its next line without a level / timestamp inherits.
+    level: Option<Level>,
+    ts: Option<i64>,
+    /// One of its lines in the chunk had its own level / timestamp.
+    own_level: bool,
+    own_ts: bool,
+}
+
+/// A chunk's assumption about one source's inherited values: `Some` for
+/// each value its first lines used.
+#[derive(Debug, Clone, Copy)]
+struct Assumed {
+    source: SourceId,
+    level: Option<Option<Level>>,
+    ts: Option<Option<i64>>,
+}
+
+/// The rows just before a chunk, read (and parsed) only when one of its
+/// lines needs to inherit something.
+struct Lookback<'a> {
+    v: &'a Inner,
+    a: usize,
+    formats: &'a [Format],
+    /// Parsed `(source, level, ts)` of rows `a - len .. a`, nearest first.
+    rows: Vec<(SourceId, Option<Level>, Option<i64>)>,
+    stage: usize,
+}
+
+impl Lookback<'_> {
+    /// The level and timestamp source `source` carries into the chunk, as
+    /// far as the lookback can tell (`None` if it is too far back).
+    fn find(&mut self, source: SourceId) -> (Option<Level>, Option<i64>) {
+        let (mut level, mut ts) = (None, None);
+        let mut k = 0;
+        loop {
+            while k < self.rows.len() {
+                let (s, l, t) = self.rows[k];
+                if s == source {
+                    level = level.or(l);
+                    ts = ts.or(t);
+                    if level.is_some() && ts.is_some() {
+                        return (level, ts);
+                    }
+                }
+                k += 1;
+            }
+            if !self.extend() {
+                return (level, ts);
+            }
+        }
+    }
+
+    /// Read the next, longer stretch of rows before the chunk.
+    fn extend(&mut self) -> bool {
+        let have = self.rows.len();
+        let Some(&want) = CARRY_LOOKBACK.get(self.stage) else {
+            return false;
+        };
+        self.stage += 1;
+        let want = want.min(self.a);
+        if want <= have {
+            return want > have;
+        }
+        let back = self.v.base.chunk(self.a - want, self.a - have);
+        for k in (0..back.len()).rev() {
+            let source = back.row(k).source();
+            let fmt = self
+                .formats
+                .get(source as usize)
+                .copied()
+                .unwrap_or_default();
+            let m = parse_line(back.line(k), fmt, self.v.default_year);
+            self.rows.push((source, m.level, m.ts));
+        }
+        true
+    }
 }
 
 /// Per-chunk work: filter + collapse + metadata for the histogram.
-fn process_chunk(v: &Inner, a: usize, b: usize, time_axis: bool) -> ChunkOut {
+///
+/// Lines without a level or timestamp inherit those of the previous line of
+/// the same source that had one.  For the first such lines of a chunk that
+/// is found before it: from `carry` when the caller knows it, otherwise by
+/// a bounded look back, recorded in [`ChunkOut::assumed`] so the builder can
+/// check it and redo the chunk if it was wrong.
+fn process_chunk(
+    v: &Inner,
+    a: usize,
+    b: usize,
+    time_axis: bool,
+    carry: Option<&Carry>,
+) -> ChunkOut {
     let chunk = v.base.chunk(a, b);
     let formats = v.base.formats();
     let filter = &v.spec.filter;
     let collapse = v.spec.collapse;
-    let needs_meta = true;
     let mut out = ChunkOut {
         rows: Vec::with_capacity(if filter.is_empty() { chunk.len() } else { 64 }),
         marks: Vec::with_capacity(chunk.len()),
@@ -768,47 +907,62 @@ fn process_chunk(v: &Inner, a: usize, b: usize, time_axis: bool) -> ChunkOut {
         ts_min: None,
         ts_max: None,
         saw_ts: false,
+        assumed: Vec::new(),
+        last_own: Vec::new(),
     };
-    // Carry-in: inherit level/ts from preceding lines.
-    let (mut carry_level, mut carry_ts) = (None, None);
-    if a > 0 {
-        let back = v.base.chunk(a.saturating_sub(CARRY_LOOKBACK), a);
-        for k in (0..back.len()).rev() {
-            let fmt = formats
-                .get(back.row(k).source() as usize)
-                .copied()
-                .unwrap_or_default();
-            let m = parse_line(back.line(k), fmt, v.default_year);
-            if carry_level.is_none() {
-                carry_level = m.level;
-            }
-            if carry_ts.is_none() {
-                carry_ts = m.ts;
-            }
-            if carry_level.is_some() && carry_ts.is_some() {
-                break;
-            }
-        }
-    }
+    // Inherited values only change the result when the filter looks at
+    // levels / times, or (timestamps) when the histogram is on a time axis.
+    let level_matters = filter.min_level.is_some();
+    let ts_matters = time_axis || filter.since.is_some() || filter.until.is_some();
+    let mut lookback = Lookback {
+        v,
+        a,
+        formats: &formats,
+        rows: Vec::new(),
+        stage: 0,
+    };
+    // Per source; single-file views only ever use slot 0.
+    let mut state = vec![SourceState::default(); formats.len().max(1)];
     let mut prev_key: Option<u64> = None;
     for i in 0..chunk.len() {
         let line = chunk.line(i);
         let row = chunk.row(i);
-        let fmt = formats
-            .get(row.source() as usize)
-            .copied()
-            .unwrap_or_default();
-        let meta = if needs_meta {
-            parse_line(line, fmt, v.default_year)
-        } else {
-            LineMeta::default()
-        };
+        let source = row.source();
+        let fmt = formats.get(source as usize).copied().unwrap_or_default();
+        let meta = parse_line(line, fmt, v.default_year);
+        let si = source as usize;
+        if si >= state.len() {
+            state.resize(si + 1, SourceState::default());
+        }
+        let st = &mut state[si];
+        if !st.seen {
+            // First line of this source in the chunk: find what it inherits.
+            st.seen = true;
+            let need_level = meta.level.is_none() && level_matters;
+            let need_ts = meta.ts.is_none() && ts_matters;
+            if a > 0 && (need_level || need_ts) {
+                let (level, ts) = match carry {
+                    Some(c) => c.get(source),
+                    None => lookback.find(source),
+                };
+                st.level = level;
+                st.ts = ts;
+                out.assumed.push(Assumed {
+                    source,
+                    level: need_level.then_some(level),
+                    ts: need_ts.then_some(ts),
+                });
+            }
+        }
         if meta.level.is_some() {
-            carry_level = meta.level;
+            st.level = meta.level;
+            st.own_level = true;
         }
         if meta.ts.is_some() {
-            carry_ts = meta.ts;
+            st.ts = meta.ts;
+            st.own_ts = true;
         }
+        let (carry_level, carry_ts) = (st.level, st.ts);
         let effective = LineMeta {
             level: carry_level,
             ts: carry_ts,
@@ -847,6 +1001,15 @@ fn process_chunk(v: &Inner, a: usize, b: usize, time_axis: bool) -> ChunkOut {
         }
         out.rows.push(row.with_count(1));
     }
+    for (si, st) in state.iter().enumerate() {
+        if st.own_level || st.own_ts {
+            out.last_own.push((
+                si as SourceId,
+                st.level.filter(|_| st.own_level),
+                st.ts.filter(|_| st.own_ts),
+            ));
+        }
+    }
     out
 }
 
@@ -862,6 +1025,8 @@ fn builder_main(view: View) {
     let threads = crate::par::worker_threads();
     let mut seen_gen = v.base.generation();
     let mut consumed: usize = 0;
+    // What lines inherit at row `consumed`; carried over between batches.
+    let mut carry = Carry::default();
     let mut last_key: Option<u64> = None;
     let time_axis = v.hist.read().is_time();
     let mut last_wake = Instant::now();
@@ -874,6 +1039,7 @@ fn builder_main(view: View) {
         if gen != seen_gen {
             seen_gen = gen;
             consumed = 0;
+            carry = Carry::default();
             last_key = None;
             v.rows.write().clear();
             v.hist.write().clear();
@@ -899,11 +1065,21 @@ fn builder_main(view: View) {
                 |i| {
                     let a = start + i * CHUNK_ROWS;
                     let b = (a + CHUNK_ROWS).min(avail);
-                    process_chunk(v, a, b, time_axis)
+                    process_chunk(v, a, b, time_axis, None)
                 },
                 |i, out: ChunkOut| {
                     let a = start + i * CHUNK_ROWS;
                     let b = (a + CHUNK_ROWS).min(avail);
+                    // The chunk guessed what its first lines inherit (by
+                    // looking back a little); the chunks before it say what
+                    // they really inherit.  Redo it when the guess was wrong
+                    // (a long stack trace across the chunk start, say).
+                    let out = if carry.agrees(&out.assumed) {
+                        out
+                    } else {
+                        process_chunk(v, a, b, time_axis, Some(&carry))
+                    };
+                    carry.advance(&out.last_own);
                     if !v.identity {
                         let mut rows = v.rows.write();
                         let mut incoming = out.rows;
@@ -1061,6 +1237,59 @@ mod tests {
         assert_eq!(h.total, 3);
         assert_eq!(v.stats().levels[Level::Error.index()], 1);
         assert_eq!(v.stats().levels[crate::timeline::NO_LEVEL], 1);
+    }
+
+    fn level_spec(level: Level) -> ViewSpec {
+        ViewSpec {
+            filter: Filter::from_spec(&FilterSpec {
+                level: Some(level),
+                ..Default::default()
+            })
+            .unwrap(),
+            collapse: false,
+        }
+    }
+
+    #[test]
+    fn long_traces_inherit_across_chunks() {
+        // An ERROR just before a chunk boundary, then more stack frames than
+        // the short look back covers (inheritance used to stop after 64).
+        // The frames end in a chunk of their own, and a lone level-less
+        // block far from any level exercises the redo too.
+        let mut text = String::new();
+        for i in 0..CHUNK_ROWS - 3 {
+            text.push_str(&format!("2026-10-13 10:00:00 INFO line {i}\n"));
+        }
+        text.push_str("2026-10-13 10:00:01 ERROR boom\n");
+        for i in 0..CHUNK_ROWS + 5_000 {
+            text.push_str(&format!("\tat Frame{i}(X.java:1)\n"));
+        }
+        text.push_str("2026-10-13 10:00:02 INFO after\n");
+        let v = built(mem(&text), level_spec(Level::Error));
+        assert_eq!(v.len(), 1 + CHUNK_ROWS + 5_000);
+        let last = v.row(v.len() - 1).unwrap().line();
+        assert_eq!(last as usize, CHUNK_ROWS - 3 + CHUNK_ROWS + 5_000);
+    }
+
+    #[test]
+    fn merged_sources_inherit_from_their_own_lines() {
+        // b.log's lines have no level: they must not take a.log's ERROR.
+        let a = Source::from_bytes(
+            "a.log",
+            b"2026-10-13T10:00:00Z ERROR db lost\n\tat Db.connect\n".to_vec(),
+        );
+        let b = Source::from_bytes(
+            "b.log",
+            b"2026-10-13T10:00:01Z just a message\n2026-10-13T10:00:02Z another\n".to_vec(),
+        );
+        let merged = crate::merge::Merged::start(vec![a, b]);
+        let v = built(Base::Merged(merged), level_spec(Level::Error));
+        let rows: Vec<(SourceId, u64)> = v
+            .rows(0, 10)
+            .iter()
+            .map(|r| (r.source(), r.line()))
+            .collect();
+        assert_eq!(rows, vec![(0, 0), (0, 1)]);
     }
 
     #[test]

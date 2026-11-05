@@ -58,7 +58,13 @@ needed. Items marked **review** deserve a look from the owner.
   wrapped message) inherits the level and timestamp of the previous line
   for filtering, so `--level error` keeps the trace under an `ERROR` line.
   The histogram and statistics count such lines as "no level" so they do
-  not inflate error counts.
+  not inflate error counts. Inheritance is per source (in a merged view a
+  frame never takes the level of another file's line) and has no length
+  limit: view chunks are built in parallel, so each one guesses what its
+  first lines inherit by looking back up to 4096 rows, and the builder,
+  which knows the true value from the chunks before, redoes a chunk whose
+  guess was wrong. Lookups only happen when the filter or a time-axis
+  histogram uses the inherited value.
 - **Timestamps without a zone are treated as UTC.** hem only needs
   timestamps to be mutually consistent for ordering, bucketing and
   `--since/--until`; the original text is what gets displayed (unless the
